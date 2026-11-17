@@ -896,6 +896,7 @@ final class WebPExpressAvif
         $config = self::getConfig();
         $enabled = self::pictureModeEnabled($config) &&
             self::hasActiveAvifEncoder($config) &&
+            !empty($config['enable-redirection-to-webp-realizer']) &&
             isset($config['scope']) &&
             is_array($config['scope']) &&
             isset($config['image-types']);

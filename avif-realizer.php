@@ -560,6 +560,9 @@ class AvifRealizer extends WodConfigLoader
             if (!isset($wodOptions['image-roots'])) {
                 self::fail('WebP Express image roots are not configured.');
             }
+            if (empty($wodOptions['enable-redirection-to-webp-realizer'])) {
+                self::fail('WebP Express redirection to the AVIF realizer is not enabled.');
+            }
 
             $scope = array_filter(explode('|', $scopeValue), function ($rootId) {
                 return preg_match('/^[a-z0-9-]+$/i', $rootId);
