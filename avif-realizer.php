@@ -420,12 +420,8 @@ class AvifRealizer extends WodConfigLoader
         $imageRoots = self::getImageRootsDef();
         $sourceRoot = $imageRoots->byId($sourceRootId);
         $source = $sourceRoot->getAbsPath() . '/' . $sourceRelative;
-        $source = realpath($source);
-        if (!is_string($source) || !is_file($source)) {
+        if (!is_file($source)) {
             self::fail('The requested source image does not exist.');
-        }
-        if (!self::sourceIsInRequestedScope($source, $imageRoots, $scope)) {
-            self::fail('The requested source image is not enabled in WebP Express scope.');
         }
         if (!self::enabledImageType($source, $imageTypes)) {
             self::fail('The requested source image type is disabled in WebP Express.');
