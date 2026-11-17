@@ -6,6 +6,7 @@
  * Version: 1.0.1
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
+ * Primary Branch: main
  * Requires PHP: 8.3
  * License: GPL-2.0-or-later
  */
