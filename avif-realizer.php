@@ -92,27 +92,9 @@ class AvifRealizer extends WodConfigLoader
         exit;
     }
 
-    private static function sourceIsInRequestedScope($source, $imageRoots, $scope)
+    private static function sourceIsInRequestedScope($source, $scope)
     {
-        $sourcePath = realpath($source);
-        if ($sourcePath === false) {
-            return false;
-        }
-
-        foreach ($imageRoots->getArray() as $imageRoot) {
-            if (!in_array($imageRoot->id, $scope, true)) {
-                continue;
-            }
-            $rootPath = realpath($imageRoot->getAbsPath());
-            if ($rootPath === false) {
-                continue;
-            }
-            $rootPrefix = rtrim($rootPath, '/\\') . DIRECTORY_SEPARATOR;
-            if (strpos($sourcePath, $rootPrefix) === 0) {
-                return true;
-            }
-        }
-        return false;
+        return \WebPExpress\Paths::findImageRootOfPath($source, $scope) !== false;
     }
 
     private static function enabledImageType($source, $imageTypes)
@@ -432,7 +414,7 @@ class AvifRealizer extends WodConfigLoader
         $source = realpath($source);
         if (!is_string($source) ||
             !is_file($source) ||
-            !self::sourceIsInRequestedScope($source, $imageRoots, $scope) ||
+            !self::sourceIsInRequestedScope($source, $scope) ||
             !self::enabledImageType($source, $imageTypes)) {
             self::fail('The requested source image is not enabled in WebP Express scope.');
         }
@@ -585,7 +567,7 @@ class AvifRealizer extends WodConfigLoader
                 $imageRoots
             );
             if (!is_string($source) ||
-                !self::sourceIsInRequestedScope($source, $imageRoots, $scope) ||
+                !self::sourceIsInRequestedScope($source, $scope) ||
                 !self::enabledImageType($source, $imageTypes)) {
                 self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
             }
