@@ -392,6 +392,7 @@ class AvifRealizer extends WodConfigLoader
             self::fail('Required varied-image rewrite settings were not supplied.');
         }
 
+        $sourceRelativeRewriteValue = $sourceRelative;
         $sourceRelative = rawurldecode($sourceRelative);
         $sourceRelative = SanityCheck::pathWithoutDirectoryTraversal($sourceRelative);
         if (strpos($sourceRelative, '\\') !== false ||
@@ -421,7 +422,21 @@ class AvifRealizer extends WodConfigLoader
         $sourceRoot = $imageRoots->byId($sourceRootId);
         $source = $sourceRoot->getAbsPath() . '/' . $sourceRelative;
         if (!is_file($source)) {
-            self::fail('The requested source image does not exist.');
+            $rewritePathForLog = substr(
+                preg_replace('/[\x00-\x1f\x7f]/', '?', $sourceRelativeRewriteValue),
+                0,
+                512
+            );
+            $sourcePathForLog = substr(
+                preg_replace('/[\x00-\x1f\x7f]/', '?', $source),
+                0,
+                1024
+            );
+            self::fail(
+                'The requested source image does not exist. root=' . $sourceRootId .
+                ' rewrite-relative=' . $rewritePathForLog .
+                ' resolved=' . $sourcePathForLog
+            );
         }
         if (!self::enabledImageType($source, $imageTypes)) {
             self::fail('The requested source image type is disabled in WebP Express.');
