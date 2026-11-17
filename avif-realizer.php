@@ -301,19 +301,29 @@ class AvifRealizer extends WodConfigLoader
         }
     }
 
-    private static function serve($destination, $options)
+    private static function serve($destination, $options, $varyAccept = false)
     {
         if (!is_readable($destination)) {
             self::fail('Converted AVIF is not readable: ' . $destination);
         }
         header('X-Content-Type-Options: nosniff');
         header('Content-Type: image/avif');
+        if ($varyAccept) {
+            header('Vary: Accept', false);
+        }
         header('Content-Length: ' . filesize($destination));
         $modified = filemtime($destination);
         if ($modified !== false) {
             header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $modified) . ' GMT');
         }
 
+        self::applyCacheControl($options);
+        readfile($destination);
+        exit;
+    }
+
+    private static function applyCacheControl($options)
+    {
         $serveOptions = isset($options['webp-convert']['serve-image'])
             ? $options['webp-convert']['serve-image']
             : array();
@@ -321,14 +331,195 @@ class AvifRealizer extends WodConfigLoader
             isset($serveOptions['cache-control-header'])) {
             header('Cache-Control: ' . $serveOptions['cache-control-header']);
         }
-        readfile($destination);
+    }
+
+    private static function serveWebpFallback($source, $webpDestination, $wodOptions, $options)
+    {
+        if (!is_string($webpDestination) || !preg_match('/\.webp$/i', $webpDestination)) {
+            self::fail('Could not construct a safe WebP fallback destination.');
+        }
+        $accept = isset($_SERVER['HTTP_ACCEPT']) ? $_SERVER['HTTP_ACCEPT'] : '';
+        if (!preg_match('/image\/webp/i', $accept) ||
+            (!is_file($webpDestination) && empty($wodOptions['enable-redirection-to-converter']))) {
+            self::serveOriginal($source, $options);
+        }
+        $serveOptions = $options['webp-convert'];
+        $logDir = !empty($wodOptions['enable-logging'])
+            ? self::$webExpressContentDirAbs . '/log'
+            : null;
+        header('Vary: Accept', false);
+        ConvertHelperIndependent::serveConverted(
+            $source,
+            $webpDestination,
+            $serveOptions,
+            $logDir,
+            'WebP fallback for AVIF varied response'
+        );
         exit;
+    }
+
+    private static function serveOriginal($source, $options)
+    {
+        $extension = strtolower(pathinfo($source, PATHINFO_EXTENSION));
+        $contentType = (($extension == 'jpg') || ($extension == 'jpeg'))
+            ? 'image/jpeg'
+            : 'image/png';
+        header('Vary: Accept', false);
+        header('X-Content-Type-Options: nosniff');
+        header('Content-Type: ' . $contentType);
+        header('Content-Length: ' . filesize($source));
+        $modified = filemtime($source);
+        if ($modified !== false) {
+            header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $modified) . ' GMT');
+        }
+        self::applyCacheControl($options);
+        readfile($source);
+        exit;
+    }
+
+    private static function processVariedRequest()
+    {
+        $sourceRelative = self::rewriteValue('WE_AVIF_SOURCE_REL');
+        $sourceRootId = self::rewriteValue('WE_AVIF_SOURCE_ROOT');
+        $scopeValue = self::rewriteValue('WE_AVIF_SCOPE');
+        $imageTypes = intval(self::rewriteValue('WE_AVIF_IMAGE_TYPES'));
+        $preventLarger = (self::rewriteValue('WE_AVIF_PREVENT_LARGER') == '1');
+        $allowOnDemand = (self::rewriteValue('WE_AVIF_ALLOW_ON_DEMAND') == '1');
+        $jpegQuality = self::rewriteValue('WE_AVIF_JPEG_QUALITY');
+        $pngQuality = self::rewriteValue('WE_AVIF_PNG_QUALITY');
+        $jpegQuality = (is_string($jpegQuality) && ctype_digit($jpegQuality) && intval($jpegQuality) <= 100)
+            ? intval($jpegQuality)
+            : 50;
+        $pngQuality = (is_string($pngQuality) && ctype_digit($pngQuality) && intval($pngQuality) <= 100)
+            ? intval($pngQuality)
+            : 50;
+
+        if (!is_string($sourceRelative) ||
+            !is_string($sourceRootId) ||
+            !preg_match('/^[a-z0-9-]+$/i', $sourceRootId) ||
+            !is_string($scopeValue)) {
+            self::fail('Required varied-image rewrite settings were not supplied.');
+        }
+
+        $sourceRelative = rawurldecode($sourceRelative);
+        $sourceRelative = SanityCheck::pathWithoutDirectoryTraversal($sourceRelative);
+        if (strpos($sourceRelative, '\\') !== false ||
+            strpos($sourceRelative, "\0") !== false ||
+            !preg_match('/\.(jpe?g|png)$/i', $sourceRelative)) {
+            self::fail('The requested source image path is invalid.');
+        }
+
+        $scope = array_filter(explode('|', $scopeValue), function ($rootId) {
+            return preg_match('/^[a-z0-9-]+$/i', $rootId);
+        });
+        if (!in_array($sourceRootId, $scope, true)) {
+            self::fail('The requested source image root is outside WebP Express scope.');
+        }
+
+        self::loadConfig();
+        $wodOptions = self::$wodOptions;
+        $options = self::$options;
+        $convertOptions = $options['webp-convert']['convert'];
+        if (!isset($wodOptions['image-roots']) ||
+            !isset($wodOptions['destination-folder']) ||
+            !isset($wodOptions['destination-extension'])) {
+            self::fail('WebP Express image and destination settings are incomplete.');
+        }
+
+        $imageRoots = self::getImageRootsDef();
+        $sourceRoot = $imageRoots->byId($sourceRootId);
+        $source = $sourceRoot->getAbsPath() . '/' . $sourceRelative;
+        $source = realpath($source);
+        if (!is_string($source) ||
+            !is_file($source) ||
+            !self::sourceIsInRequestedScope($source, $imageRoots, $scope) ||
+            !self::enabledImageType($source, $imageTypes)) {
+            self::fail('The requested source image is not enabled in WebP Express scope.');
+        }
+
+        $uploadDirAbs = $imageRoots->byId('uploads')->getAbsPath();
+        $webpDestination = ConvertHelperIndependent::getDestination(
+            $source,
+            $wodOptions['destination-folder'],
+            $wodOptions['destination-extension'],
+            self::$webExpressContentDirAbs,
+            $uploadDirAbs,
+            self::$usingDocRoot,
+            $imageRoots
+        );
+        if (!is_string($webpDestination) || !preg_match('/\.webp$/i', $webpDestination)) {
+            self::fail('WebP Express could not determine the WebP destination.');
+        }
+        $destination = ($wodOptions['destination-folder'] == 'mingled')
+            ? $webpDestination . '.avif'
+            : preg_replace('/\.webp$/i', '.avif', $webpDestination);
+        if (!is_string($destination)) {
+            self::fail('Could not determine the AVIF destination.');
+        }
+
+        if ($preventLarger &&
+            is_file(\WebPExpress\Paths::getBiggerThanSourceDirAbs() .
+                '/' . $sourceRootId . '/' . $sourceRelative . '.webp')) {
+            self::serveOriginal($source, $options);
+        }
+
+        if (is_file($source . '.do-not-convert') || is_file($source . '.dontreplace')) {
+            self::serveOriginal($source, $options);
+        }
+
+        if (is_file($destination)) {
+            $destinationSize = filesize($destination);
+            $sourceSize = filesize($source);
+            if ($preventLarger && ($destinationSize !== false) && ($sourceSize !== false) &&
+                ($destinationSize >= $sourceSize)) {
+                error_log('[WebP Express AVIF] Removing cached AVIF that is larger than its source: ' . $destination);
+                if (!@unlink($destination)) {
+                    self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
+                }
+            } else {
+                self::serve($destination, $options, true);
+            }
+        }
+
+        if (!$allowOnDemand) {
+            self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
+        }
+
+        $converter = self::findAvifEncoder($convertOptions);
+        if ($converter === false) {
+            AvifConversionLogger::log(
+                $source,
+                $destination,
+                false,
+                !empty($wodOptions['enable-logging']),
+                self::$webExpressContentDirAbs
+            );
+            self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
+        }
+        if (!self::writeAvif(
+            $source,
+            $destination,
+            $convertOptions,
+            $converter,
+            $preventLarger,
+            $jpegQuality,
+            $pngQuality,
+            !empty($wodOptions['enable-logging']),
+            self::$webExpressContentDirAbs
+        )) {
+            self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
+        }
+        self::serve($destination, $options, true);
     }
 
     public static function processRequest()
     {
         try {
             self::removeSpoofableRewriteHeaders();
+            if (self::rewriteValue('WE_AVIF_MODE') == 'varied') {
+                self::processVariedRequest();
+                return;
+            }
             $htaccessId = self::rewriteValue('WE_HTACCESS_ID');
             $destinationRelative = self::rewriteValue('WE_DESTINATION_REL_HTACCESS');
             $scopeValue = self::rewriteValue('WE_AVIF_SCOPE');

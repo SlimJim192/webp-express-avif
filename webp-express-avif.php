@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WebP Express AVIF
  * Plugin URI: https://github.com/SlimJim192/webp-express-avif
- * Description: Adds on-demand AVIF sources to WebP Express picture tags, using its image and cache settings.
+ * Description: Adds AVIF support to WebP Express picture tags and varied image responses.
  * Version: 1.0.1
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
@@ -244,6 +244,12 @@ final class WebPExpressAvif
             isset($config['alter-html']['replacement']) &&
             ($config['alter-html']['replacement'] == 'picture')
         );
+    }
+
+    private static function variedImageModeEnabled($config)
+    {
+        return isset($config['operation-mode']) &&
+            ($config['operation-mode'] == 'varied-image-responses');
     }
 
     public static function startOutputBuffer()
@@ -920,6 +926,24 @@ final class WebPExpressAvif
         if (is_dir($uploadDirectory)) {
             self::saveRewriteRules($uploadDirectory . '/.htaccess', $uploadsRules, false);
         }
+
+        $variedEnabled = self::variedImageModeEnabled($config) &&
+            self::hasActiveAvifEncoder($config) &&
+            (!empty($config['enable-redirection-to-converter']) ||
+                !empty($config['redirect-to-existing-in-htaccess'])) &&
+            isset($config['scope']) &&
+            is_array($config['scope']) &&
+            !empty($config['image-types']);
+        foreach (\WebPExpress\Paths::getImageRootIds() as $rootId) {
+            $sourceDirectory = \WebPExpress\Paths::getAbsDirById($rootId);
+            if (!is_string($sourceDirectory) || !is_dir($sourceDirectory)) {
+                continue;
+            }
+            $sourceRules = ($variedEnabled && in_array($rootId, $config['scope'], true))
+                ? self::variedRewriteRulesFor($rootId, $realizerPath, $config)
+                : array();
+            self::saveNegotiationRules($sourceDirectory . '/.htaccess', $sourceRules);
+        }
     }
 
     public static function syncRewriteRulesBeforeSettingsRedirect($location, $status)
@@ -962,6 +986,12 @@ final class WebPExpressAvif
         if (class_exists('\WebPExpress\Paths') &&
             class_exists('\WebPExpress\DestinationOptions')) {
             $rootIds = \WebPExpress\Paths::getImageRootIds();
+            foreach ($rootIds as $rootId) {
+                $sourceDirectory = \WebPExpress\Paths::getAbsDirById($rootId);
+                if (is_string($sourceDirectory) && is_dir($sourceDirectory)) {
+                    self::saveNegotiationRules($sourceDirectory . '/.htaccess', array());
+                }
+            }
             foreach (array(false, true) as $useDocRoot) {
                 $destinationOptions = new \WebPExpress\DestinationOptions(
                     false,
@@ -991,24 +1021,10 @@ final class WebPExpressAvif
     private static function rewriteRulesFor($rootId, $realizerPath, $config)
     {
         $extensionPattern = ($rootId == 'uploads') ? '(.+\.webp\.avif)' : '(.+\.avif)';
-        $flags = array(
+        $flags = array_merge(array(
             'E=WE_DESTINATION_REL_HTACCESS:$1',
             'E=WE_HTACCESS_ID:' . $rootId,
-            'E=WE_AVIF_SCOPE:' . implode('|', $config['scope']),
-            'E=WE_AVIF_IMAGE_TYPES:' . intval($config['image-types']),
-            'E=WE_AVIF_PREVENT_LARGER:' . (!empty($config['prevent-using-webps-larger-than-original']) ? '1' : '0'),
-            'E=HASH:' . \WebPExpress\Paths::getConfigHash()
-        );
-        $qualitySettings = self::getAvifQualitySettings();
-        $flags[] = 'E=WE_AVIF_JPEG_QUALITY:' . $qualitySettings['jpeg_quality'];
-        $flags[] = 'E=WE_AVIF_PNG_QUALITY:' . $qualitySettings['png_quality'];
-        if (($config['destination-structure'] == 'doc-root') &&
-            \WebPExpress\Paths::canUseDocRootForStructuringCacheDir()) {
-            $flags[] = 'E=WPCONTENT:' . \WebPExpress\Paths::getContentDirRel();
-        } else {
-            $flags[] = 'E=WE_WP_CONTENT_REL_TO_WE_PLUGIN_DIR:' .
-                \WebPExpress\Paths::getContentDirRelToWebPExpressPluginDir();
-        }
+        ), self::rewriteEnvironmentFlags($config));
         $flags[] = 'E=WE_AVIF_REQUEST_URI:%{REQUEST_URI}';
         $flags[] = 'NC';
         $flags[] = 'L';
@@ -1024,6 +1040,128 @@ final class WebPExpressAvif
             '  AddType image/avif .avif',
             '</IfModule>'
         );
+    }
+
+    private static function variedRewriteRulesFor($rootId, $realizerPath, $config)
+    {
+        $extensions = array();
+        if (intval($config['image-types']) & 1) {
+            $extensions[] = 'jpe?g';
+        }
+        if (intval($config['image-types']) & 2) {
+            $extensions[] = 'png';
+        }
+        if (empty($extensions)) {
+            return array();
+        }
+
+        $flags = array_merge(array(
+            'E=WE_AVIF_MODE:varied',
+            'E=WE_AVIF_SOURCE_REL:$1',
+            'E=WE_AVIF_SOURCE_ROOT:' . $rootId,
+            'E=WE_AVIF_ALLOW_ON_DEMAND:' .
+                (!empty($config['enable-redirection-to-converter']) ? '1' : '0'),
+        ), self::rewriteEnvironmentFlags($config));
+        $flags[] = 'NC';
+        $flags[] = 'L';
+
+        return array(
+            '<IfModule mod_rewrite.c>',
+            '  RewriteEngine On',
+            '  RewriteCond %{QUERY_STRING} !dontreplace$',
+            '  RewriteCond %{QUERY_STRING} !original$',
+            '  RewriteCond %{HTTP_ACCEPT} image/avif [NC]',
+            '  RewriteCond %{REQUEST_FILENAME} -f',
+            '  RewriteCond %{REQUEST_FILENAME} (?i)\.(?:' . implode('|', $extensions) . ')$',
+            '  RewriteCond %{REQUEST_FILENAME}.dontreplace !-f',
+            '  RewriteCond %{REQUEST_FILENAME}.do-not-convert !-f',
+            '  RewriteRule ^(.+\.(?:' . implode('|', $extensions) . '))$ ' . $realizerPath .
+                ' [' . implode(',', $flags) . ']',
+            '</IfModule>'
+        );
+    }
+
+    private static function rewriteEnvironmentFlags($config)
+    {
+        $flags = array(
+            'E=WE_AVIF_SCOPE:' . implode('|', $config['scope']),
+            'E=WE_AVIF_IMAGE_TYPES:' . intval($config['image-types']),
+            'E=WE_AVIF_PREVENT_LARGER:' . (!empty($config['prevent-using-webps-larger-than-original']) ? '1' : '0'),
+            'E=HASH:' . \WebPExpress\Paths::getConfigHash()
+        );
+        $qualitySettings = self::getAvifQualitySettings();
+        $flags[] = 'E=WE_AVIF_JPEG_QUALITY:' . $qualitySettings['jpeg_quality'];
+        $flags[] = 'E=WE_AVIF_PNG_QUALITY:' . $qualitySettings['png_quality'];
+        if (($config['destination-structure'] == 'doc-root') &&
+            \WebPExpress\Paths::canUseDocRootForStructuringCacheDir()) {
+            $flags[] = 'E=WPCONTENT:' . \WebPExpress\Paths::getContentDirRel();
+        } else {
+            $flags[] = 'E=WE_WP_CONTENT_REL_TO_WE_PLUGIN_DIR:' .
+                \WebPExpress\Paths::getContentDirRelToWebPExpressPluginDir();
+        }
+        return $flags;
+    }
+
+    private static function saveNegotiationRules($filename, $rules)
+    {
+        $directory = dirname($filename);
+        if (!is_dir($directory)) {
+            error_log('[WebP Express AVIF] Cannot update negotiation rules in a missing directory: ' . $directory);
+            return false;
+        }
+        if (is_link($filename)) {
+            error_log('[WebP Express AVIF] Refusing to update a symlinked negotiation rules file: ' . $filename);
+            return false;
+        }
+
+        if (is_file($filename)) {
+            $content = file_get_contents($filename);
+            if ($content === false) {
+                error_log('[WebP Express AVIF] Could not read ' . $filename . ' to update negotiation rules.');
+                return false;
+            }
+        } else {
+            $content = '';
+        }
+
+        $markerPattern = '/^# BEGIN WebP Express AVIF Negotiation\r?\n.*?^# END WebP Express AVIF Negotiation\r?\n?/ms';
+        $contentWithoutRules = preg_replace($markerPattern, '', $content, -1, $removed);
+        if (!is_string($contentWithoutRules)) {
+            error_log('[WebP Express AVIF] Could not parse negotiation rules in ' . $filename);
+            return false;
+        }
+        if (empty($rules) && ($removed === 0)) {
+            return true;
+        }
+
+        $updated = $contentWithoutRules;
+        if (!empty($rules)) {
+            $block = "# BEGIN WebP Express AVIF Negotiation\n" .
+                implode("\n", $rules) .
+                "\n# END WebP Express AVIF Negotiation\n";
+            if (preg_match('/^# BEGIN WebP Express\r?$/m', $contentWithoutRules, $matches, PREG_OFFSET_CAPTURE)) {
+                $offset = $matches[0][1];
+                $prefix = substr($contentWithoutRules, 0, $offset);
+                if (($prefix != '') && !preg_match('/(?:\r\n|\r|\n)$/', $prefix)) {
+                    $prefix .= "\n";
+                }
+                $updated = $prefix . $block . substr($contentWithoutRules, $offset);
+            } else {
+                $separator = ($contentWithoutRules == '' || preg_match('/(?:\r\n|\r|\n)$/', $contentWithoutRules))
+                    ? ''
+                    : "\n";
+                $updated = $contentWithoutRules . $separator . $block;
+            }
+        }
+
+        if ($updated === $content) {
+            return true;
+        }
+        if (file_put_contents($filename, $updated, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write negotiation rules in ' . $filename);
+            return false;
+        }
+        return true;
     }
 
     private static function saveRewriteRules($filename, $rules, $createDirectory)

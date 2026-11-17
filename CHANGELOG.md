@@ -4,6 +4,8 @@
 
 - Integrate AVIF generation and logging with WebP Express bulk conversion and
   logging settings.
+- Support AVIF content negotiation in WebP Express's "Varied image responses"
+  operation mode, with WebP Express handling WebP fallback conversion.
 - Refresh AVIF rewrite rules after settings saves, including forced updates.
 - Remove the plugin's marked rewrite and MIME blocks on deactivation.
 - Honor the configured Cache-Control header for successful AVIF responses.
