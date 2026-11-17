@@ -10,6 +10,7 @@ if (!is_file($webpExpressAutoloader)) {
 }
 
 require_once $webpExpressAutoloader;
+require_once __DIR__ . '/avif-conversion-logger.php';
 
 class AvifRealizer extends WodConfigLoader
 {
@@ -213,6 +214,37 @@ class AvifRealizer extends WodConfigLoader
         $converter,
         $preventLarger,
         $jpegQuality,
+        $pngQuality,
+        $loggingEnabled,
+        $webPExpressContentDir
+    )
+    {
+        $success = self::writeAvifFile(
+            $source,
+            $destination,
+            $convertOptions,
+            $converter,
+            $preventLarger,
+            $jpegQuality,
+            $pngQuality
+        );
+        AvifConversionLogger::log(
+            $source,
+            $destination,
+            $success,
+            $loggingEnabled,
+            $webPExpressContentDir
+        );
+        return $success;
+    }
+
+    private static function writeAvifFile(
+        $source,
+        $destination,
+        $convertOptions,
+        $converter,
+        $preventLarger,
+        $jpegQuality,
         $pngQuality
     )
     {
@@ -274,7 +306,7 @@ class AvifRealizer extends WodConfigLoader
         if (!is_readable($destination)) {
             self::fail('Converted AVIF is not readable: ' . $destination);
         }
-        self::noCache();
+        header('X-Content-Type-Options: nosniff');
         header('Content-Type: image/avif');
         header('Content-Length: ' . filesize($destination));
         $modified = filemtime($destination);
@@ -386,16 +418,27 @@ class AvifRealizer extends WodConfigLoader
             }
 
             $converter = self::findAvifEncoder($convertOptions);
-            if ($converter === false ||
-                !self::writeAvif(
+            if ($converter === false) {
+                AvifConversionLogger::log(
                     $source,
                     $destination,
-                    $convertOptions,
-                    $converter,
-                    $preventLarger,
-                    $jpegQuality,
-                    $pngQuality
-                )) {
+                    false,
+                    !empty($wodOptions['enable-logging']),
+                    self::$webExpressContentDirAbs
+                );
+                self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
+            }
+            if (!self::writeAvif(
+                $source,
+                $destination,
+                $convertOptions,
+                $converter,
+                $preventLarger,
+                $jpegQuality,
+                $pngQuality,
+                !empty($wodOptions['enable-logging']),
+                self::$webExpressContentDirAbs
+            )) {
                 self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
             }
             self::serve($destination, $options);

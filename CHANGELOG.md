@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 - 2026-11-17
+
+- Integrate AVIF generation and logging with WebP Express bulk conversion and
+  logging settings.
+- Refresh AVIF rewrite rules after settings saves, including forced updates.
+- Remove the plugin's marked rewrite and MIME blocks on deactivation.
+- Honor the configured Cache-Control header for successful AVIF responses.
+
 ## 1.0.0 - 2026-11-17
 
 First release.

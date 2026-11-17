@@ -44,8 +44,8 @@ converts only the corresponding JPEG or PNG source. Its rules are installed in
 the WebP Express cache directory and, for mingled uploads, the uploads
 directory. They use a separate marker block and are refreshed from the
 WebP Express settings page; WebP Express can regenerate its own block without
-removing the AVIF rules. Deactivating this plugin removes its rewrite blocks
-without deleting generated AVIF files.
+removing the AVIF rules. Deactivating this plugin removes its marked rewrite and
+MIME blocks without deleting generated AVIF files.
 
 After upgrading from a version that generated AVIF files without public-read
 permissions, use WebP Express's "Delete converted files" button once so the
@@ -57,12 +57,17 @@ Otherwise, AVIF files are generated only when requested. Existing derivatives
 are removed when WordPress deletes their source image. WebP Express's cache
 purge action also removes generated AVIF derivatives, and the purge result
 reports WebP and AVIF deletion/failure counts separately.
+The WebP Express bulk-convert action also generates AVIF for each eligible
+image it converts. When WebP Express logging is enabled, AVIF results are
+appended to the corresponding conversion log.
 
 AVIF encoding follows WebP Express's active converter order, but only Imagick
 and GD are supported because the bundled WebP converters do not produce AVIF.
 The WebP Express metadata setting and the option that prevents using converted
-images larger than their source are also applied to AVIF. If the configured PHP
-encoder cannot create AVIF, the AVIF request redirects to its WebP equivalent.
+images larger than their source are also applied to AVIF. The configured
+Cache-Control header is applied to successful AVIF responses. If the configured
+PHP encoder cannot create AVIF, the AVIF request redirects to its WebP
+equivalent.
 
 The plugin installs Apache mod_rewrite and `image/avif` MIME rules alongside
 the realizer route. Apache with mod_rewrite and permission to update the
@@ -74,3 +79,6 @@ Nginx.
 This plugin does not add AVIF sources when WebP Express is configured to replace
 image URLs instead of using picture tags, or when WebP Express is in
 no-conversion mode.
+
+WebP Express settings saves, including forced rewrite-rule updates, refresh this
+plugin's separate Apache rewrite block without replacing WebP Express's rules.

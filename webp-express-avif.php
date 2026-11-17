@@ -3,7 +3,7 @@
  * Plugin Name: WebP Express AVIF
  * Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Description: Adds on-demand AVIF sources to WebP Express picture tags, using its image and cache settings.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Requires PHP: 8.3
@@ -13,6 +13,8 @@
 if (!defined('ABSPATH')) {
     exit;
 }
+
+require_once __DIR__ . '/avif-conversion-logger.php';
 
 final class WebPExpressAvif
 {
@@ -31,12 +33,13 @@ final class WebPExpressAvif
         add_action('admin_menu', array(__CLASS__, 'addSettingsPage'));
         add_action('admin_init', array(__CLASS__, 'registerSettings'));
         add_action('admin_init', array(__CLASS__, 'syncRewriteRules'));
+        add_filter('wp_redirect', array(__CLASS__, 'syncRewriteRulesBeforeSettingsRedirect'), 10, 2);
         add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueuePurgeScript'), 1000);
-        add_action('admin_post_webpexpress_settings_submit', array(__CLASS__, 'syncRewriteRules'), 1000);
         add_filter('wp_handle_upload', array(__CLASS__, 'handleUpload'), 20, 2);
         add_filter('image_make_intermediate_size', array(__CLASS__, 'handleIntermediateSize'), 20, 1);
         add_filter('wp_delete_file', array(__CLASS__, 'deleteDerivative'), 20, 2);
         add_action('wp_ajax_webpexpress_purge_cache', array(__CLASS__, 'purgeAvifCache'), 1);
+        add_action('wp_ajax_convert_file', array(__CLASS__, 'convertAvifDuringBulkConvert'), 1);
     }
 
     public static function missingWebPExpressNotice()
@@ -525,7 +528,62 @@ final class WebPExpressAvif
         return true;
     }
 
-    private static function writeAvif($source, $destination, $config, $destinationRoot)
+    private static function removeMimeTypeRule($filename)
+    {
+        if (!is_file($filename)) {
+            return true;
+        }
+        if (is_link($filename)) {
+            error_log('[WebP Express AVIF] Refusing to edit symlinked .htaccess file: ' . $filename);
+            return false;
+        }
+
+        $content = file_get_contents($filename);
+        if ($content === false) {
+            error_log('[WebP Express AVIF] Could not read ' . $filename . ' to remove the AVIF MIME type.');
+            return false;
+        }
+
+        $pattern = '/^# BEGIN WebP Express AVIF MIME\r?\n.*?^# END WebP Express AVIF MIME\r?\n?/ms';
+        if (!preg_match($pattern, $content)) {
+            return true;
+        }
+        $updated = preg_replace($pattern, '', $content);
+        if (!is_string($updated)) {
+            error_log('[WebP Express AVIF] Could not remove the AVIF MIME type from ' . $filename);
+            return false;
+        }
+        if (file_put_contents($filename, $updated, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write ' . $filename . ' after removing the AVIF MIME type.');
+            return false;
+        }
+        return true;
+    }
+
+    private static function writeAvif($source, $destination, $config, $destinationRoot, $writeLog = true)
+    {
+        $sourceModified = @filemtime($source);
+        $destinationModified = @filemtime($destination);
+        $isCurrent = is_file($destination) &&
+            ($sourceModified !== false) &&
+            ($destinationModified !== false) &&
+            ($destinationModified >= $sourceModified);
+        if ($isCurrent && !empty($config['prevent-using-webps-larger-than-original'])) {
+            $destinationSize = @filesize($destination);
+            $sourceSize = @filesize($source);
+            $isCurrent = ($destinationSize !== false) &&
+                ($sourceSize !== false) &&
+                ($destinationSize < $sourceSize);
+        }
+
+        $success = self::writeAvifFile($source, $destination, $config, $destinationRoot);
+        if ($writeLog && !$isCurrent) {
+            self::logAvifConversion($source, $destination, $success);
+        }
+        return $success;
+    }
+
+    private static function writeAvifFile($source, $destination, $config, $destinationRoot)
     {
         if (is_file($destination) &&
             !empty($config['prevent-using-webps-larger-than-original']) &&
@@ -610,6 +668,18 @@ final class WebPExpressAvif
                 unlink($temporaryFile);
             }
         }
+    }
+
+    private static function logAvifConversion($source, $destination, $success)
+    {
+        $config = self::getConfig();
+        \WebPExpress\AvifConversionLogger::log(
+            $source,
+            $destination,
+            $success,
+            !empty($config['enable-logging']),
+            \WebPExpress\Paths::getWebPExpressContentDirAbs()
+        );
     }
 
     private static function destinationForSource($source, $config)
@@ -852,21 +922,69 @@ final class WebPExpressAvif
         }
     }
 
+    public static function syncRewriteRulesBeforeSettingsRedirect($location, $status)
+    {
+        if (isset($_REQUEST['action']) &&
+            is_string($_REQUEST['action']) &&
+            ($_REQUEST['action'] == 'webpexpress_settings_submit') &&
+            current_user_can('manage_options')) {
+            self::syncRewriteRules();
+        }
+        return $location;
+    }
+
     public static function removeRewriteRules()
     {
         $cacheDir = defined('WP_CONTENT_DIR')
             ? rtrim(WP_CONTENT_DIR, '/\\') . '/webp-express/webp-images'
             : false;
+        $mimeFiles = array();
         if (class_exists('\WebPExpress\Paths')) {
             $cacheDir = \WebPExpress\Paths::getCacheDirAbs();
         }
         if (is_string($cacheDir) && is_dir($cacheDir)) {
             self::saveRewriteRules($cacheDir . '/.htaccess', array(), false);
+            $mimeFiles[] = $cacheDir . '/.htaccess';
         }
 
-        $upload = wp_upload_dir(null, false);
-        if (!empty($upload['basedir']) && is_dir($upload['basedir'])) {
-            self::saveRewriteRules(rtrim($upload['basedir'], '/\\') . '/.htaccess', array(), false);
+        if (class_exists('\WebPExpress\Paths')) {
+            $uploadDirectory = \WebPExpress\Paths::getUploadDirAbs();
+        } else {
+            $upload = wp_upload_dir(null, false);
+            $uploadDirectory = isset($upload['basedir']) ? $upload['basedir'] : false;
+        }
+        if (is_string($uploadDirectory) && is_dir($uploadDirectory)) {
+            $uploadHtaccess = rtrim($uploadDirectory, '/\\') . '/.htaccess';
+            self::saveRewriteRules($uploadHtaccess, array(), false);
+            $mimeFiles[] = $uploadHtaccess;
+        }
+
+        if (class_exists('\WebPExpress\Paths') &&
+            class_exists('\WebPExpress\DestinationOptions')) {
+            $rootIds = \WebPExpress\Paths::getImageRootIds();
+            foreach (array(false, true) as $useDocRoot) {
+                $destinationOptions = new \WebPExpress\DestinationOptions(
+                    false,
+                    $useDocRoot,
+                    false,
+                    $rootIds
+                );
+                foreach ($rootIds as $rootId) {
+                    try {
+                        $destinationRoot = \WebPExpress\Paths::destinationRoot($rootId, $destinationOptions);
+                    } catch (\Throwable $e) {
+                        error_log('[WebP Express AVIF] Could not resolve a destination root during deactivation: ' . $e->getMessage());
+                        continue;
+                    }
+                    if (isset($destinationRoot['abs-path']) && is_string($destinationRoot['abs-path'])) {
+                        $mimeFiles[] = rtrim($destinationRoot['abs-path'], '/\\') . '/.htaccess';
+                    }
+                }
+            }
+        }
+
+        foreach (array_unique($mimeFiles) as $mimeFile) {
+            self::removeMimeTypeRule($mimeFile);
         }
     }
 
@@ -961,6 +1079,41 @@ final class WebPExpressAvif
             return;
         }
         self::writeAvif($source, $destination, $config, $root['abs-path']);
+    }
+
+    public static function convertAvifDuringBulkConvert()
+    {
+        if (!current_user_can('manage_options') ||
+            !check_ajax_referer('webpexpress-ajax-convert-nonce', 'nonce', false) ||
+            !isset($_POST['filename']) ||
+            !is_string($_POST['filename'])) {
+            return;
+        }
+
+        $source = realpath(wp_unslash($_POST['filename']));
+        if ($source === false || !is_file($source)) {
+            return;
+        }
+
+        $config = self::getConfig();
+        if (!self::pictureModeEnabled($config) ||
+            !self::imageTypeEnabled($source, $config) ||
+            !self::sourceIsInScope($source, $config) ||
+            !self::hasActiveAvifEncoder($config)) {
+            return;
+        }
+
+        $destination = self::destinationForSource($source, $config);
+        $root = self::getDestinationRoot($source, $config);
+        if ($destination === false || $root === false) {
+            error_log('[WebP Express AVIF] Could not determine the AVIF destination for bulk conversion: ' . $source);
+            return;
+        }
+
+        $success = self::writeAvif($source, $destination, $config, $root['abs-path'], false);
+        register_shutdown_function(function () use ($source, $destination, $success) {
+            self::logAvifConversion($source, $destination, $success);
+        });
     }
 
     public static function handleUpload($fileArray, $overrides = false)
