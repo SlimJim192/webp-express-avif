@@ -3,7 +3,7 @@
  * Plugin Name: WebP Express AVIF
  * Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Description: Adds AVIF support to WebP Express picture tags and varied image responses.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Primary Branch: main
@@ -36,10 +36,12 @@ final class WebPExpressAvif
         add_action('admin_init', array(__CLASS__, 'syncRewriteRules'));
         add_filter('wp_redirect', array(__CLASS__, 'syncRewriteRulesBeforeSettingsRedirect'), 10, 2);
         add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueuePurgeScript'), 1000);
+        add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueueLiveTestScript'), 1000);
         add_filter('wp_handle_upload', array(__CLASS__, 'handleUpload'), 20, 2);
         add_filter('image_make_intermediate_size', array(__CLASS__, 'handleIntermediateSize'), 20, 1);
         add_filter('wp_delete_file', array(__CLASS__, 'deleteDerivative'), 20, 2);
         add_action('wp_ajax_webpexpress_purge_cache', array(__CLASS__, 'purgeAvifCache'), 1);
+        add_action('wp_ajax_webpexpress_avif_live_test', array(__CLASS__, 'runLiveTestAjax'));
         add_action('wp_ajax_convert_file', array(__CLASS__, 'convertAvifDuringBulkConvert'), 1);
     }
 
@@ -144,7 +146,21 @@ final class WebPExpressAvif
         settings_fields('webpexpress_avif');
         do_settings_sections('webpexpress-avif');
         submit_button();
-        echo '</form></div>';
+        echo '</form>';
+        self::renderLiveTests();
+        echo '</div>';
+    }
+
+    private static function renderLiveTests()
+    {
+        echo '<hr><h2>AVIF live tests</h2>';
+        echo '<p>Run a request against your site to check each AVIF rewrite route. Tests create and remove a temporary JPEG and AVIF in the uploads/cache folders.</p>';
+        echo '<p>';
+        echo '<button type="button" class="button" data-webpexpress-avif-test="existing">Test existing AVIF response</button> ';
+        echo '<button type="button" class="button" data-webpexpress-avif-test="converter">Test source conversion</button> ';
+        echo '<button type="button" class="button" data-webpexpress-avif-test="realizer">Test picture-tag realizer</button>';
+        echo '</p>';
+        echo '<pre id="webpexpress-avif-live-test-output" aria-live="polite" style="white-space:pre-wrap"></pre>';
     }
 
     public static function renderQualitySection()
@@ -186,6 +202,286 @@ final class WebPExpressAvif
             is_file($scriptPath) ? (string)filemtime($scriptPath) : '1.0.0',
             true
         );
+    }
+
+    public static function enqueueLiveTestScript()
+    {
+        if (!current_user_can('manage_options') ||
+            !isset($_GET['page']) ||
+            ($_GET['page'] != 'webpexpress-avif')) {
+            return;
+        }
+
+        $scriptPath = __DIR__ . '/avif-live-tests.js';
+        wp_enqueue_script(
+            'webpexpress-avif-live-tests',
+            plugin_dir_url(__FILE__) . 'avif-live-tests.js',
+            array(),
+            is_file($scriptPath) ? (string)filemtime($scriptPath) : '1.0.0',
+            true
+        );
+        wp_localize_script(
+            'webpexpress-avif-live-tests',
+            'WebPExpressAvifLiveTests',
+            array(
+                'ajaxUrl' => admin_url('admin-ajax.php'),
+                'nonce' => wp_create_nonce('webpexpress_avif_live_test')
+            )
+        );
+    }
+
+    public static function runLiveTestAjax()
+    {
+        check_ajax_referer('webpexpress_avif_live_test', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'You are not allowed to run AVIF live tests.'), 403);
+        }
+
+        $test = isset($_POST['test']) ? sanitize_key(wp_unslash($_POST['test'])) : '';
+        try {
+            $log = self::runLiveTest($test);
+            wp_send_json_success(array('log' => $log));
+        } catch (\Throwable $e) {
+            wp_send_json_error(array('message' => $e->getMessage()), 400);
+        }
+    }
+
+    private static function runLiveTest($test)
+    {
+        $config = self::getConfig();
+        $testRequirements = array(
+            'existing' => array(
+                'name' => 'Existing AVIF varied response',
+                'required-setting' => 'redirect-to-existing-in-htaccess',
+                'setting-description' => 'Enable redirection to existing WebP files in WebP Express'
+            ),
+            'converter' => array(
+                'name' => 'AVIF source conversion',
+                'required-setting' => 'enable-redirection-to-converter',
+                'setting-description' => 'Enable redirection to the WebP converter'
+            ),
+            'realizer' => array(
+                'name' => 'Picture-tag AVIF realizer',
+                'required-setting' => 'enable-redirection-to-webp-realizer',
+                'setting-description' => 'Enable redirection to the WebP realizer'
+            )
+        );
+        if (!isset($testRequirements[$test])) {
+            throw new \RuntimeException('Unknown AVIF live test.');
+        }
+        $requirement = $testRequirements[$test];
+        $log = array($requirement['name']);
+
+        if (empty($config[$requirement['required-setting']])) {
+            throw new \RuntimeException($requirement['setting-description'] . ' in WebP Express before running this test.');
+        }
+        if ($test == 'realizer') {
+            if (!self::pictureModeEnabled($config)) {
+                throw new \RuntimeException('Select picture-tag HTML replacement in WebP Express before running this test.');
+            }
+        } elseif (!self::variedImageModeEnabled($config)) {
+            throw new \RuntimeException('Select Varied image responses in WebP Express before running this test.');
+        }
+        if (!self::hasActiveAvifEncoder($config)) {
+            throw new \RuntimeException('No active WebP Express Imagick or GD converter can encode AVIF.');
+        }
+        if (!isset($config['scope']) ||
+            !is_array($config['scope']) ||
+            !in_array('uploads', $config['scope'], true) ||
+            !self::imageTypeEnabled('live-test.jpg', $config)) {
+            throw new \RuntimeException('Include JPEG images in the uploads scope in WebP Express to run these tests.');
+        }
+
+        $uploadsPath = \WebPExpress\Paths::getAbsDirById('uploads');
+        $uploadsUrl = \WebPExpress\Paths::getUrlById('uploads');
+        if (!is_string($uploadsPath) || !is_dir($uploadsPath) ||
+            !is_string($uploadsUrl) || $uploadsUrl == '') {
+            throw new \RuntimeException('Could not locate the WordPress uploads directory and URL.');
+        }
+
+        $token = bin2hex(random_bytes(8));
+        $testDirectory = rtrim($uploadsPath, '/\\') . '/webp-express-avif-live-tests/' . $token;
+        $source = $testDirectory . '/live-test.jpg';
+        $sourceCreated = false;
+        $destinationOwned = false;
+        $destination = false;
+        $existingAvifHash = false;
+
+        if (file_exists($testDirectory)) {
+            throw new \RuntimeException('The temporary AVIF test directory already exists. Please run the test again.');
+        }
+        if (!wp_mkdir_p($testDirectory)) {
+            throw new \RuntimeException('Could not create the temporary AVIF test directory in uploads.');
+        }
+
+        try {
+            $sourceCreated = true;
+            self::createLiveTestImage($source);
+            $destinationRoot = self::getDestinationRoot($source, $config);
+            if ($destinationRoot === false ||
+                !isset($destinationRoot['abs-path']) ||
+                !isset($destinationRoot['url'])) {
+                throw new \RuntimeException('Could not determine the WebP Express destination for the test image.');
+            }
+            $destination = self::destinationForSource($source, $config);
+            if (!is_string($destination) || file_exists($destination)) {
+                throw new \RuntimeException('Could not determine an unused AVIF destination for the test image.');
+            }
+            $destinationOwned = true;
+            if ($test == 'existing') {
+                if (!self::writeAvif($source, $destination, $config, $destinationRoot['abs-path'], false)) {
+                    throw new \RuntimeException('Could not create the AVIF fixture. Check the active AVIF encoder and the "prevent using larger images" setting.');
+                }
+                $existingAvifHash = hash_file('sha256', $destination);
+                $originalSourceHash = hash_file('sha256', $source);
+                if (!is_string($existingAvifHash) || !is_string($originalSourceHash)) {
+                    throw new \RuntimeException('Could not read the generated AVIF and JPEG fixtures.');
+                }
+                self::createLiveTestImage($source);
+                $changedSourceHash = hash_file('sha256', $source);
+                if (!is_string($changedSourceHash) ||
+                    ($changedSourceHash === $originalSourceHash) ||
+                    !touch($source, time() + 5)) {
+                    throw new \RuntimeException('Could not prepare a changed source image for the existing-AVIF route check.');
+                }
+                $requestUrl = self::liveTestUrl($uploadsUrl, $uploadsPath, $source);
+            } elseif ($test == 'converter') {
+                $requestUrl = self::liveTestUrl($uploadsUrl, $uploadsPath, $source);
+            } else {
+                $requestUrl = self::liveTestUrl($destinationRoot['url'], $destinationRoot['abs-path'], $destination);
+            }
+
+            $log[] = 'Request URL: ' . $requestUrl;
+            $response = wp_remote_get(
+                $requestUrl,
+                array(
+                    'headers' => array(
+                        'Accept' => 'image/avif',
+                        'Cache-Control' => 'no-cache'
+                    ),
+                    'timeout' => 30,
+                    'redirection' => 0,
+                    'sslverify' => !(defined('WP_DEBUG') && WP_DEBUG)
+                )
+            );
+            if (is_wp_error($response)) {
+                throw new \RuntimeException('The live request failed: ' . $response->get_error_message());
+            }
+
+            $status = wp_remote_retrieve_response_code($response);
+            $contentType = wp_remote_retrieve_header($response, 'content-type');
+            $body = wp_remote_retrieve_body($response);
+            $log[] = 'Response: ' . $status . ' ' . wp_remote_retrieve_response_message($response);
+            $log[] = 'Content-Type: ' . ($contentType ? $contentType : '(missing)');
+            if ($status != 200) {
+                throw new \RuntimeException('The test request returned HTTP ' . $status . '. Check the AVIF rewrite rules and server error log.');
+            }
+            if (stripos((string)$contentType, 'image/avif') !== 0) {
+                throw new \RuntimeException('The test request returned Content-Type "' . (string)$contentType . '", not image/avif.');
+            }
+            if (!is_string($body) || $body === '') {
+                throw new \RuntimeException('The test request returned an empty response body.');
+            }
+            if ($test == 'existing') {
+                $currentAvifHash = is_file($destination) ? hash_file('sha256', $destination) : false;
+                if (!is_file($destination) ||
+                    !is_string($currentAvifHash) ||
+                    $currentAvifHash !== $existingAvifHash) {
+                    throw new \RuntimeException('The request did not serve the existing AVIF directly; the cached file changed or disappeared.');
+                }
+            } else {
+                if (!is_file($destination)) {
+                    throw new \RuntimeException('The request returned AVIF but did not create the expected cached AVIF file.');
+                }
+            }
+            $log[] = 'PASS: received a non-empty AVIF response.';
+            return $log;
+        } finally {
+            if ($destinationOwned && is_string($destination) && is_file($destination) && !unlink($destination)) {
+                error_log('[WebP Express AVIF] Could not remove live-test AVIF fixture: ' . $destination);
+            }
+            if ($sourceCreated && is_file($source) && !unlink($source)) {
+                error_log('[WebP Express AVIF] Could not remove live-test source fixture: ' . $source);
+            }
+            if (is_dir($testDirectory) && !rmdir($testDirectory)) {
+                error_log('[WebP Express AVIF] Could not remove live-test directory: ' . $testDirectory);
+            }
+        }
+    }
+
+    private static function createLiveTestImage($filename)
+    {
+        $width = 256;
+        $height = 256;
+        if (function_exists('imagecreatetruecolor') && function_exists('imagejpeg')) {
+            $image = imagecreatetruecolor($width, $height);
+            if ($image === false) {
+                throw new \RuntimeException('Could not allocate the temporary JPEG image.');
+            }
+            try {
+                for ($y = 0; $y < $height; $y += 4) {
+                    for ($x = 0; $x < $width; $x += 4) {
+                        $color = imagecolorallocate($image, random_int(0, 255), random_int(0, 255), random_int(0, 255));
+                        if ($color === false || !imagefilledrectangle($image, $x, $y, $x + 3, $y + 3, $color)) {
+                            throw new \RuntimeException('Could not draw the temporary JPEG image.');
+                        }
+                    }
+                }
+                if (!imagejpeg($image, $filename, 95) || !is_file($filename) || filesize($filename) === 0) {
+                    throw new \RuntimeException('Could not write the temporary JPEG image.');
+                }
+            } finally {
+                imagedestroy($image);
+            }
+            return;
+        }
+
+        if (class_exists('\Imagick')) {
+            $image = new \Imagick();
+            try {
+                $image->newImage($width, $height, new \ImagickPixel('white'));
+                $draw = new \ImagickDraw();
+                for ($y = 0; $y < $height; $y += 4) {
+                    for ($x = 0; $x < $width; $x += 4) {
+                        $draw->setFillColor(sprintf(
+                            'rgb(%d,%d,%d)',
+                            random_int(0, 255),
+                            random_int(0, 255),
+                            random_int(0, 255)
+                        ));
+                        $draw->rectangle($x, $y, $x + 3, $y + 3);
+                    }
+                }
+                $image->drawImage($draw);
+                $image->setImageFormat('JPEG');
+                $image->setImageCompressionQuality(95);
+                if (!$image->writeImage($filename) || !is_file($filename) || filesize($filename) === 0) {
+                    throw new \RuntimeException('Could not write the temporary JPEG image.');
+                }
+            } finally {
+                $image->clear();
+                $image->destroy();
+            }
+            return;
+        }
+
+        throw new \RuntimeException('The active AVIF encoder is available, but neither GD nor Imagick can create a JPEG test image.');
+    }
+
+    private static function liveTestUrl($rootUrl, $rootPath, $filePath)
+    {
+        if (!is_string($rootUrl) || !is_string($rootPath) ||
+            !is_string($filePath) || $rootUrl == '') {
+            throw new \RuntimeException('Could not construct a URL for the temporary AVIF test file.');
+        }
+        $rootPath = rtrim(wp_normalize_path($rootPath), '/') . '/';
+        $filePath = wp_normalize_path($filePath);
+        if (strpos($filePath, $rootPath) !== 0) {
+            throw new \RuntimeException('The temporary AVIF test file is outside its expected image root.');
+        }
+        $relativePath = substr($filePath, strlen($rootPath));
+        $encodedPath = implode('/', array_map('rawurlencode', explode('/', $relativePath)));
+        return trailingslashit($rootUrl) . $encodedPath;
     }
 
     private static function activeConverters($config)

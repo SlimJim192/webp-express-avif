@@ -26,6 +26,9 @@ Express's own quality options. Lower values generally reduce AVIF file size;
 AVIF generated from PNG sources may be lossy. After changing either value, use
 WebP Express's "Delete converted files" button so cached AVIF files are
 regenerated with the new quality.
+The page also provides live checks for the existing-AVIF varied response,
+source-to-converter, and picture-tag realizer routes. They require JPEG images
+in the uploads scope and the corresponding WebP Express redirection settings.
 
 ## How it works
 

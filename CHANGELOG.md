@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 - 2026-11-17
+
+- Add AVIF live tests for cached varied responses, on-demand conversion, and the
+  picture-tag realizer.
+
 ## 1.0.1 - 2026-11-17
 
 - Integrate AVIF generation and logging with WebP Express bulk conversion and
