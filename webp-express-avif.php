@@ -1053,7 +1053,7 @@ final class WebPExpressAvif
 
         $flags = array_merge(array(
             'E=WE_AVIF_MODE:varied',
-            'E=WE_AVIF_SOURCE_REL:$1',
+            'E=WE_AVIF_SOURCE_REL:$0',
             'E=WE_AVIF_SOURCE_ROOT:' . $rootId,
             'E=WE_AVIF_ALLOW_ON_DEMAND:' .
                 (!empty($config['enable-redirection-to-converter']) ? '1' : '0'),
@@ -1071,7 +1071,7 @@ final class WebPExpressAvif
             '  RewriteCond %{REQUEST_FILENAME} (?i)\.(?:' . implode('|', $extensions) . ')$',
             '  RewriteCond %{REQUEST_FILENAME}.dontreplace !-f',
             '  RewriteCond %{REQUEST_FILENAME}.do-not-convert !-f',
-            '  RewriteRule ^(.+\.(?:' . implode('|', $extensions) . '))$ ' . $realizerPath .
+            '  RewriteRule ^.*$ ' . $realizerPath .
                 ' [' . implode(',', $flags) . ']',
             '</IfModule>'
         );
