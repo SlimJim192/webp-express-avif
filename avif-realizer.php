@@ -394,12 +394,6 @@ class AvifRealizer extends WodConfigLoader
 
         $sourceRelativeRewriteValue = $sourceRelative;
         $sourceRelative = rawurldecode($sourceRelative);
-        $sourceRelative = SanityCheck::pathWithoutDirectoryTraversal($sourceRelative);
-        if (strpos($sourceRelative, '\\') !== false ||
-            strpos($sourceRelative, "\0") !== false ||
-            !preg_match('/\.(jpe?g|png)$/i', $sourceRelative)) {
-            self::fail('The requested source image path is invalid.');
-        }
 
         $scope = array_filter(explode('|', $scopeValue), function ($rootId) {
             return preg_match('/^[a-z0-9-]+$/i', $rootId);
@@ -420,7 +414,30 @@ class AvifRealizer extends WodConfigLoader
 
         $imageRoots = self::getImageRootsDef();
         $sourceRoot = $imageRoots->byId($sourceRootId);
-        $source = $sourceRoot->getAbsPath() . '/' . $sourceRelative;
+        $sourceRootPath = rtrim($sourceRoot->getAbsPath(), '/\\');
+        $normalizedSourceRoot = rtrim(str_replace('\\', '/', $sourceRootPath), '/');
+        $normalizedSource = str_replace('\\', '/', $sourceRelative);
+        $isAbsoluteSource = (isset($normalizedSource[0]) && ($normalizedSource[0] == '/')) ||
+            preg_match('/^[a-z]:\//i', $normalizedSource);
+        if ($isAbsoluteSource) {
+            $sourceRootPrefix = $normalizedSourceRoot . '/';
+            $sourceIsUnderRoot = (DIRECTORY_SEPARATOR == '\\')
+                ? (strncasecmp($normalizedSource, $sourceRootPrefix, strlen($sourceRootPrefix)) == 0)
+                : (strpos($normalizedSource, $sourceRootPrefix) === 0);
+            if (!$sourceIsUnderRoot) {
+                self::fail('The requested source image path is outside its configured image root.');
+            }
+            $sourceRelative = substr($normalizedSource, strlen($sourceRootPrefix));
+        }
+
+        $sourceRelative = SanityCheck::pathWithoutDirectoryTraversal($sourceRelative);
+        if (strpos($sourceRelative, '\\') !== false ||
+            strpos($sourceRelative, "\0") !== false ||
+            !preg_match('/\.(jpe?g|png)$/i', $sourceRelative)) {
+            self::fail('The requested source image path is invalid.');
+        }
+
+        $source = $sourceRootPath . '/' . $sourceRelative;
         if (!is_file($source)) {
             $rewritePathForLog = substr(
                 preg_replace('/[\x00-\x1f\x7f]/', '?', $sourceRelativeRewriteValue),
