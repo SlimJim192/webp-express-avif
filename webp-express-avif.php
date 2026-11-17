@@ -793,12 +793,7 @@ final class WebPExpressAvif
             if (!is_string($value) || (strpos($key, 'HTTP_') === 0)) {
                 continue;
             }
-            while (strpos($key, 'REDIRECT_') === 0 || strpos($key, 'REWRITE_') === 0) {
-                $key = (strpos($key, 'REDIRECT_') === 0)
-                    ? substr($key, 9)
-                    : substr($key, 7);
-            }
-            if ($key == $name) {
+            if (substr($key, -strlen($name)) == $name) {
                 return $value;
             }
         }

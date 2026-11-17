@@ -32,16 +32,7 @@ class AvifRealizer extends WodConfigLoader
             if (!is_string($value) || (strpos($key, 'HTTP_') === 0)) {
                 continue;
             }
-
-            while (strpos($key, 'REDIRECT_') === 0 || strpos($key, 'REWRITE_') === 0) {
-                if (strpos($key, 'REDIRECT_') === 0) {
-                    $key = substr($key, 9);
-                } else {
-                    $key = substr($key, 7);
-                }
-            }
-
-            if ($key == $name) {
+            if (substr($key, -strlen($name)) == $name) {
                 return $value;
             }
         }
@@ -92,9 +83,27 @@ class AvifRealizer extends WodConfigLoader
         exit;
     }
 
-    private static function sourceIsInRequestedScope($source, $scope)
+    private static function sourceIsInRequestedScope($source, $imageRoots, $scope)
     {
-        return \WebPExpress\Paths::findImageRootOfPath($source, $scope) !== false;
+        $sourcePath = realpath($source);
+        if ($sourcePath === false) {
+            return false;
+        }
+
+        foreach ($imageRoots->getArray() as $imageRoot) {
+            if (!in_array($imageRoot->id, $scope, true)) {
+                continue;
+            }
+            $rootPath = realpath($imageRoot->getAbsPath());
+            if ($rootPath === false) {
+                continue;
+            }
+            $rootPrefix = rtrim($rootPath, '/\\') . DIRECTORY_SEPARATOR;
+            if (strpos($sourcePath, $rootPrefix) === 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static function enabledImageType($source, $imageTypes)
@@ -412,11 +421,14 @@ class AvifRealizer extends WodConfigLoader
         $sourceRoot = $imageRoots->byId($sourceRootId);
         $source = $sourceRoot->getAbsPath() . '/' . $sourceRelative;
         $source = realpath($source);
-        if (!is_string($source) ||
-            !is_file($source) ||
-            !self::sourceIsInRequestedScope($source, $scope) ||
-            !self::enabledImageType($source, $imageTypes)) {
+        if (!is_string($source) || !is_file($source)) {
+            self::fail('The requested source image does not exist.');
+        }
+        if (!self::sourceIsInRequestedScope($source, $imageRoots, $scope)) {
             self::fail('The requested source image is not enabled in WebP Express scope.');
+        }
+        if (!self::enabledImageType($source, $imageTypes)) {
+            self::fail('The requested source image type is disabled in WebP Express.');
         }
 
         $uploadDirAbs = $imageRoots->byId('uploads')->getAbsPath();
@@ -567,7 +579,7 @@ class AvifRealizer extends WodConfigLoader
                 $imageRoots
             );
             if (!is_string($source) ||
-                !self::sourceIsInRequestedScope($source, $scope) ||
+                !self::sourceIsInRequestedScope($source, $imageRoots, $scope) ||
                 !self::enabledImageType($source, $imageTypes)) {
                 self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
             }
