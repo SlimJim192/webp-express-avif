@@ -23,9 +23,16 @@ The WordPress Settings menu includes a WebP Express AVIF page with independent
 JPEG-source and PNG-source AVIF quality controls (0-100). JPEG quality defaults
 to 65 and PNG quality defaults to 70. These settings do not change WebP
 Express's own quality options. Lower values generally reduce AVIF file size;
-AVIF generated from PNG sources may be lossy. After changing either value, use
-WebP Express's "Delete converted files" button so cached AVIF files are
-regenerated with the new quality.
+AVIF generated from PNG sources may be lossy. Saving changed quality values
+clears cached AVIF files so later requests regenerate them with the new quality.
+When both are active, GD is preferred over Imagick for AVIF because some
+Imagick versions ignore AVIF compression-quality settings.
+On multi-server installs with separate local cache directories, purge each
+server's AVIF cache; CDN caches may also need to be purged separately.
+The response-headers setting controls additional quality, encoder, size, and
+savings diagnostics for AVIF and PHP-served WebP responses. It is disabled by
+default; AVIF status and WebP Express's own serving/conversion headers remain
+available when it is off.
 The page also provides live checks for the existing-AVIF varied response,
 source-to-converter, and picture-tag realizer routes. They require JPEG images
 in the uploads scope and the corresponding WebP Express redirection settings.
@@ -60,6 +67,26 @@ For uploads using image-roots, the helper also adjusts WebP Express's generated
 on-demand rule when Apache passes an absolute source path, so the converter
 receives a path relative to the uploads root without requiring a core-plugin
 edit.
+Responses served by the AVIF realizer always include
+`X-WebP-Express-AVIF-Status` (`converted` or `existing`). When additional
+diagnostic headers are enabled, they also include `X-WebP-Express-AVIF-Quality`,
+source/output byte counts, and a size-savings percentage. Newly converted
+responses also include `X-WebP-Express-AVIF-Encoder` (`gd` or `imagick`).
+Existing files served directly by Apache include the `existing` status header;
+quality and size metrics are available only on realizer-served responses and
+when the additional-header option is enabled.
+
+WebP responses also receive diagnostics from the helper plugin. The helper
+routes WebP Express's PHP realizer requests through its own response wrapper,
+which calls the existing WebP Express request handlers without changing core
+plugin files. When additional diagnostic headers are enabled, PHP-served WebPs
+include `X-WebP-Express-WebP-Quality`, source/output byte counts, and savings;
+PNG responses also include `X-WebP-Express-WebP-Alpha-Quality`. WebP Express's own
+`X-WebP-Express` and `X-WebP-Convert-Log` headers indicate its serving or
+conversion path regardless of this option. Quality and size metrics are
+unavailable for WebPs served directly from the cache. A quality value of
+`auto` reports WebP Express's configured mode, not a per-image quality chosen
+internally by a converter.
 
 After upgrading from a version that generated AVIF files without public-read
 permissions, use WebP Express's "Delete converted files" button once so the

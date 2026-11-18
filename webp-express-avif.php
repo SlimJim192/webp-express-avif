@@ -3,7 +3,7 @@
  * Plugin Name: WebP Express AVIF
  * Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Description: Adds AVIF support to WebP Express picture tags and varied image responses.
- * Version: 1.0.3
+ * Version: 1.0.4
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Primary Branch: main
@@ -33,8 +33,11 @@ final class WebPExpressAvif
         add_action('template_redirect', array(__CLASS__, 'serveAvifRequest'), 0);
         add_action('admin_menu', array(__CLASS__, 'addSettingsPage'));
         add_action('admin_init', array(__CLASS__, 'registerSettings'));
+        add_action('admin_notices', array(__CLASS__, 'renderQualityCacheNotice'));
         add_action('admin_init', array(__CLASS__, 'syncRewriteRules'));
         add_filter('wp_redirect', array(__CLASS__, 'syncRewriteRulesBeforeSettingsRedirect'), 10, 2);
+        add_action('update_option_webpexpress_avif_settings', array(__CLASS__, 'qualitySettingsUpdated'), 10, 3);
+        add_action('add_option_webpexpress_avif_settings', array(__CLASS__, 'qualitySettingsAdded'), 10, 2);
         add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueuePurgeScript'), 1000);
         add_action('admin_enqueue_scripts', array(__CLASS__, 'enqueueLiveTestScript'), 1000);
         add_filter('wp_handle_upload', array(__CLASS__, 'handleUpload'), 20, 2);
@@ -63,13 +66,33 @@ final class WebPExpressAvif
 
     private static function getAvifQualitySettings()
     {
-        $settings = get_option('webpexpress_avif_settings', array());
+        return self::normalizeQualitySettings(get_option('webpexpress_avif_settings', array()));
+    }
+
+    private static function additionalHeadersEnabled($settings = null)
+    {
+        if ($settings === null) {
+            $settings = get_option('webpexpress_avif_settings', array());
+        }
+        return is_array($settings) &&
+            isset($settings['additional_headers']) &&
+            in_array($settings['additional_headers'], array(true, 1, '1'), true);
+    }
+
+    private static function normalizeQualitySettings($settings)
+    {
         if (!is_array($settings)) {
             $settings = array();
         }
+        $jpegQuality = isset($settings['jpeg_quality']) && is_numeric($settings['jpeg_quality'])
+            ? intval($settings['jpeg_quality'])
+            : 65;
+        $pngQuality = isset($settings['png_quality']) && is_numeric($settings['png_quality'])
+            ? intval($settings['png_quality'])
+            : 70;
         return array(
-            'jpeg_quality' => isset($settings['jpeg_quality']) ? max(0, min(100, intval($settings['jpeg_quality']))) : 65,
-            'png_quality' => isset($settings['png_quality']) ? max(0, min(100, intval($settings['png_quality']))) : 70
+            'jpeg_quality' => max(0, min(100, $jpegQuality)),
+            'png_quality' => max(0, min(100, $pngQuality))
         );
     }
 
@@ -81,7 +104,11 @@ final class WebPExpressAvif
             array(
                 'type' => 'array',
                 'sanitize_callback' => array(__CLASS__, 'sanitizeSettings'),
-                'default' => array('jpeg_quality' => 65, 'png_quality' => 70)
+                'default' => array(
+                    'jpeg_quality' => 65,
+                    'png_quality' => 70,
+                    'additional_headers' => false
+                )
             )
         );
 
@@ -105,23 +132,96 @@ final class WebPExpressAvif
             'webpexpress-avif',
             'webpexpress_avif_quality'
         );
+        add_settings_section(
+            'webpexpress_avif_headers',
+            'Response headers',
+            array(__CLASS__, 'renderHeadersSection'),
+            'webpexpress-avif'
+        );
+        add_settings_field(
+            'webpexpress_avif_additional_headers',
+            'Additional diagnostic headers',
+            array(__CLASS__, 'renderAdditionalHeadersField'),
+            'webpexpress-avif',
+            'webpexpress_avif_headers'
+        );
     }
 
     public static function sanitizeSettings($input)
     {
         if (!is_array($input)) {
-            return self::getAvifQualitySettings();
+            return array_merge(
+                self::getAvifQualitySettings(),
+                array('additional_headers' => self::additionalHeadersEnabled())
+            );
+        }
+        return array_merge(
+            self::normalizeQualitySettings($input),
+            array(
+                'additional_headers' => self::additionalHeadersEnabled($input)
+            )
+        );
+    }
+
+    public static function qualitySettingsUpdated($oldValue, $newValue, $option)
+    {
+        self::purgeAvifCacheIfQualityChanged($oldValue, $newValue);
+        if (self::additionalHeadersEnabled($oldValue) !== self::additionalHeadersEnabled($newValue)) {
+            self::syncRewriteRules();
+        }
+    }
+
+    public static function qualitySettingsAdded($option, $value)
+    {
+        self::purgeAvifCacheIfQualityChanged(
+            array('jpeg_quality' => 65, 'png_quality' => 70),
+            $value
+        );
+        self::syncRewriteRules();
+    }
+
+    private static function purgeAvifCacheIfQualityChanged($oldValue, $newValue)
+    {
+        if (self::normalizeQualitySettings($oldValue) === self::normalizeQualitySettings($newValue)) {
+            return;
         }
 
-        $settings = array();
-        foreach (array('jpeg_quality', 'png_quality') as $key) {
-            if (!isset($input[$key]) || !is_numeric($input[$key])) {
-                $settings[$key] = ($key == 'jpeg_quality') ? 65 : 70;
-                continue;
+        $counts = array('delete-count' => 0, 'fail-count' => 0);
+        $config = self::getConfig();
+        if (!is_array($config) || !isset($config['destination-folder'])) {
+            error_log('[WebP Express AVIF] Cannot purge AVIF files after a quality change: WebP Express destination settings are unavailable.');
+            $counts['fail-count']++;
+        } else {
+            $mingled = ($config['destination-folder'] == 'mingled');
+            if ($mingled) {
+                self::purgeAvifFiles(
+                    \WebPExpress\Paths::getUploadDirAbs(),
+                    $config,
+                    false,
+                    true,
+                    $counts
+                );
             }
-            $settings[$key] = max(0, min(100, intval($input[$key])));
+            self::purgeAvifFiles(
+                \WebPExpress\Paths::getCacheDirAbs(),
+                $config,
+                false,
+                $mingled,
+                $counts
+            );
         }
-        return $settings;
+
+        if ($counts['fail-count'] > 0) {
+            error_log(
+                '[WebP Express AVIF] Quality changed; ' . $counts['delete-count'] .
+                ' cached AVIF file(s) removed and ' . $counts['fail-count'] .
+                ' could not be removed.'
+            );
+        }
+
+        self::syncRewriteRules();
+        $noticeKey = 'webpexpress_avif_quality_purge_' . get_current_user_id();
+        set_transient($noticeKey, $counts, 5 * MINUTE_IN_SECONDS);
     }
 
     public static function addSettingsPage()
@@ -141,7 +241,7 @@ final class WebPExpressAvif
             return;
         }
         echo '<div class="wrap"><h1>WebP Express AVIF</h1>';
-        echo '<p>These quality values are independent of WebP Express quality settings and apply to both on-demand and upload-time AVIF conversion. Lower values generally reduce file size. AVIF output from PNG sources may be lossy. After changing quality, use WebP Express\'s "Delete converted files" button to remove cached AVIFs so they are regenerated with the new values.</p>';
+        echo '<p>These quality values are independent of WebP Express quality settings and apply to both on-demand and upload-time AVIF conversion. Lower values generally reduce file size. AVIF output from PNG sources may be lossy. Saving changed quality values clears cached AVIFs so they are regenerated with the new values on request.</p>';
         echo '<form method="post" action="options.php">';
         settings_fields('webpexpress_avif');
         do_settings_sections('webpexpress-avif');
@@ -149,6 +249,32 @@ final class WebPExpressAvif
         echo '</form>';
         self::renderLiveTests();
         echo '</div>';
+    }
+
+    public static function renderQualityCacheNotice()
+    {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        $noticeKey = 'webpexpress_avif_quality_purge_' . get_current_user_id();
+        $counts = get_transient($noticeKey);
+        if (!is_array($counts)) {
+            return;
+        }
+        delete_transient($noticeKey);
+
+        $deleted = isset($counts['delete-count']) ? intval($counts['delete-count']) : 0;
+        $failed = isset($counts['fail-count']) ? intval($counts['fail-count']) : 0;
+        $class = ($failed > 0) ? 'notice-warning' : 'notice-success';
+        $message = 'AVIF quality settings saved; ' . $deleted . ' cached AVIF file(s) removed.';
+        if ($failed > 0) {
+            $message .= ' ' . $failed . ' file(s) could not be removed; check the PHP error log.';
+        } else {
+            $message .= ' They will be regenerated on request.';
+        }
+        echo '<div class="notice ' . esc_attr($class) . ' is-dismissible"><p>' .
+            esc_html($message) . '</p></div>';
     }
 
     private static function renderLiveTests()
@@ -166,6 +292,19 @@ final class WebPExpressAvif
     public static function renderQualitySection()
     {
         echo '<p>Choose an AVIF encoder quality from 0 to 100 for each source format. Defaults: JPEG 65 and PNG 70.</p>';
+    }
+
+    public static function renderHeadersSection()
+    {
+        echo '<p>Status headers remain available. Enable this option to add configured quality, encoder, source/output size, and savings headers to PHP-served AVIF and WebP responses.</p>';
+    }
+
+    public static function renderAdditionalHeadersField()
+    {
+        $settings = get_option('webpexpress_avif_settings', array());
+        echo '<label><input type="checkbox" name="webpexpress_avif_settings[additional_headers]" value="1" ' .
+            checked(self::additionalHeadersEnabled($settings), true, false) .
+            '> Enable additional diagnostic headers (disabled by default)</label>';
     }
 
     private static function renderQualityField($key)
@@ -500,6 +639,21 @@ final class WebPExpressAvif
         return $result;
     }
 
+    private static function activeAvifConverters($config)
+    {
+        $converters = self::activeConverters($config);
+        $ordered = array();
+        // Prefer GD because Imagick may ignore its quality setting for AVIF.
+        foreach (array('gd', 'imagick') as $encoderName) {
+            foreach ($converters as $converter) {
+                if ($converter['converter'] == $encoderName) {
+                    $ordered[] = $converter;
+                }
+            }
+        }
+        return $ordered;
+    }
+
     private static function imagickSupportsAvif()
     {
         if (!class_exists('\Imagick') || !method_exists('\Imagick', 'queryFormats')) {
@@ -514,7 +668,7 @@ final class WebPExpressAvif
 
     private static function hasActiveAvifEncoder($config)
     {
-        foreach (self::activeConverters($config) as $converter) {
+        foreach (self::activeAvifConverters($config) as $converter) {
             if (($converter['converter'] == 'imagick') && self::imagickSupportsAvif()) {
                 return true;
             }
@@ -904,7 +1058,7 @@ final class WebPExpressAvif
 
         $success = false;
         try {
-            foreach (self::activeConverters($config) as $converter) {
+            foreach (self::activeAvifConverters($config) as $converter) {
                 $quality = self::qualityForSource($source);
                 try {
                     if (is_file($temporaryFile) && (file_put_contents($temporaryFile, '') === false)) {
@@ -1235,6 +1389,7 @@ final class WebPExpressAvif
         }
 
         self::patchUploadOnDemandSourceRule();
+        self::syncWebPDiagnosticsRules();
     }
 
     private static function patchUploadOnDemandSourceRule()
@@ -1334,6 +1489,202 @@ final class WebPExpressAvif
         return true;
     }
 
+    private static function getWebPDiagnosticsHtaccessFiles()
+    {
+        $directories = array();
+        if (class_exists('\WebPExpress\Paths')) {
+            $directories[] = \WebPExpress\Paths::getCacheDirAbs();
+            foreach (\WebPExpress\Paths::getImageRootIds() as $rootId) {
+                $directory = \WebPExpress\Paths::getAbsDirById($rootId);
+                if (is_string($directory)) {
+                    $directories[] = $directory;
+                }
+            }
+        } else {
+            if (defined('WP_CONTENT_DIR')) {
+                $directories[] = rtrim(WP_CONTENT_DIR, '/\\') . '/webp-express/webp-images';
+                $directories[] = rtrim(WP_CONTENT_DIR, '/\\');
+                $directories[] = rtrim(WP_CONTENT_DIR, '/\\') . '/themes';
+                $directories[] = rtrim(WP_CONTENT_DIR, '/\\') . '/plugins';
+            }
+            if (function_exists('wp_upload_dir')) {
+                $upload = wp_upload_dir(null, false);
+                if (isset($upload['basedir']) && is_string($upload['basedir'])) {
+                    $directories[] = $upload['basedir'];
+                }
+            }
+            if (defined('ABSPATH')) {
+                $directories[] = ABSPATH;
+            }
+        }
+
+        $files = array();
+        foreach (array_unique($directories) as $directory) {
+            if (is_string($directory) && is_dir($directory)) {
+                $files[] = rtrim($directory, '/\\') . '/.htaccess';
+            }
+        }
+        return array_values(array_unique($files));
+    }
+
+    private static function webPDiagnosticRoutePaths()
+    {
+        $wrapperUrl = plugins_url('webp-response-realizer.php', __FILE__);
+        $wrapperPath = parse_url($wrapperUrl, PHP_URL_PATH);
+        $corePluginFile = dirname(__DIR__) . '/webp-express/webp-express.php';
+        $routes = array();
+        foreach (array('on-demand', 'realizer') as $route) {
+            $filename = ($route == 'on-demand') ? 'webp-on-demand.php' : 'webp-realizer.php';
+            $coreUrl = plugins_url('wod/' . $filename, $corePluginFile);
+            $corePath = parse_url($coreUrl, PHP_URL_PATH);
+            if (!is_string($corePath) || $corePath == '') {
+                error_log('[WebP Express AVIF] Could not determine the WebP Express ' . $route . ' URL.');
+                return false;
+            }
+            $routes[$route] = $corePath;
+        }
+
+        if (!is_string($wrapperPath) || $wrapperPath == '') {
+            error_log('[WebP Express AVIF] Could not determine the WebP diagnostics wrapper URL.');
+            return false;
+        }
+        return array('wrapper' => $wrapperPath, 'core' => $routes);
+    }
+
+    private static function syncWebPDiagnosticsRules()
+    {
+        $routePaths = self::webPDiagnosticRoutePaths();
+        if ($routePaths === false) {
+            return;
+        }
+        $remove = !self::additionalHeadersEnabled();
+        foreach (self::getWebPDiagnosticsHtaccessFiles() as $filename) {
+            self::updateWebPDiagnosticsRules($filename, $routePaths, $remove);
+        }
+    }
+
+    private static function rewriteWebPDiagnosticRuleLine($line, $routePaths, $remove, &$changed)
+    {
+        if (!preg_match(
+            '/^(\s*RewriteRule\s+.*?\s)(\S+?)(\?[^\s]*)?(\s+\[[^\]\r\n]*\])(\r?\n)?$/i',
+            $line,
+            $matches
+        )) {
+            return $line;
+        }
+
+        $target = $matches[2];
+        $route = false;
+        if (preg_match('#(?:^|/)webp-on-demand\.php$#i', $target)) {
+            $route = 'on-demand';
+        } elseif (preg_match('#(?:^|/)webp-realizer\.php$#i', $target)) {
+            $route = 'realizer';
+        } elseif ($target == $routePaths['wrapper']) {
+            if (preg_match('/E=WE_AVIF_WEBP_DIAG_ROUTE:(on-demand|realizer)/i', $matches[4], $routeMatch)) {
+                $route = strtolower($routeMatch[1]);
+            }
+        }
+
+        if ($route === false) {
+            return $line;
+        }
+
+        $newTarget = $target;
+        $flags = $matches[4];
+        if ($remove) {
+            if ($target == $routePaths['wrapper']) {
+                $newTarget = $routePaths['core'][$route];
+            } else {
+                return $line;
+            }
+        } else {
+            $newTarget = $routePaths['wrapper'];
+        }
+
+        $updatedFlags = preg_replace(
+            '/,?E=WE_AVIF_WEBP_DIAG_ROUTE:(?:on-demand|realizer)/i',
+            '',
+            $flags
+        );
+        $updatedFlags = preg_replace('/,?E=WE_AVIF_WEBP_DIAG_HEADERS:1/i', '', $updatedFlags);
+        $updatedFlags = str_replace('[,', '[', $updatedFlags);
+        if (!$remove) {
+            $closingBracket = strrpos($updatedFlags, ']');
+            if ($closingBracket === false) {
+                return $line;
+            }
+            $updatedFlags = substr($updatedFlags, 0, $closingBracket) .
+                ',E=WE_AVIF_WEBP_DIAG_ROUTE:' . $route .
+                ',E=WE_AVIF_WEBP_DIAG_HEADERS:1' .
+                substr($updatedFlags, $closingBracket);
+        }
+
+        $updatedLine = $matches[1] . $newTarget .
+            (isset($matches[3]) ? $matches[3] : '') .
+            $updatedFlags .
+            (isset($matches[5]) ? $matches[5] : '');
+        if ($updatedLine != $line) {
+            $changed = true;
+        }
+        return $updatedLine;
+    }
+
+    private static function updateWebPDiagnosticsRules($filename, $routePaths, $remove)
+    {
+        if (!is_file($filename)) {
+            return true;
+        }
+        if (is_link($filename)) {
+            error_log('[WebP Express AVIF] Refusing to update a symlinked WebP diagnostics rules file: ' . $filename);
+            return false;
+        }
+
+        $content = file_get_contents($filename);
+        if ($content === false) {
+            error_log('[WebP Express AVIF] Could not read WebP diagnostics rules file: ' . $filename);
+            return false;
+        }
+
+        $diagnosticsBlockPattern = '/^# BEGIN WebP Express AVIF WebP Diagnostics\r?\n.*?^# END WebP Express AVIF WebP Diagnostics\r?\n?/ms';
+        $contentWithoutDiagnostics = preg_replace($diagnosticsBlockPattern, '', $content, -1, $removedBlocks);
+        if (!is_string($contentWithoutDiagnostics)) {
+            error_log('[WebP Express AVIF] Could not parse WebP diagnostics rules in ' . $filename);
+            return false;
+        }
+
+        $changed = ($contentWithoutDiagnostics !== $content);
+        $coreBlockPattern = '/^# BEGIN WebP Express\r?\n.*?^# END WebP Express\r?\n?/ms';
+        $updated = preg_replace_callback(
+            $coreBlockPattern,
+            function ($matches) use ($routePaths, $remove, &$changed) {
+                $lines = preg_split('/(?<=\n)/', $matches[0]);
+                foreach ($lines as $index => $line) {
+                    $lines[$index] = self::rewriteWebPDiagnosticRuleLine(
+                        $line,
+                        $routePaths,
+                        $remove,
+                        $changed
+                    );
+                }
+                return implode('', $lines);
+            },
+            $contentWithoutDiagnostics
+        );
+        if (!is_string($updated)) {
+            error_log('[WebP Express AVIF] Could not update WebP Express rewrite rules in ' . $filename);
+            return false;
+        }
+
+        if ($updated === $content) {
+            return true;
+        }
+        if (file_put_contents($filename, $updated, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write WebP diagnostics rules to ' . $filename);
+            return false;
+        }
+        return true;
+    }
+
     public static function syncRewriteRulesBeforeSettingsRedirect($location, $status)
     {
         if (isset($_REQUEST['action']) &&
@@ -1347,6 +1698,13 @@ final class WebPExpressAvif
 
     public static function removeRewriteRules()
     {
+        $routePaths = self::webPDiagnosticRoutePaths();
+        if ($routePaths !== false) {
+            foreach (self::getWebPDiagnosticsHtaccessFiles() as $filename) {
+                self::updateWebPDiagnosticsRules($filename, $routePaths, true);
+            }
+        }
+
         $cacheDir = defined('WP_CONTENT_DIR')
             ? rtrim(WP_CONTENT_DIR, '/\\') . '/webp-express/webp-images'
             : false;
@@ -1420,9 +1778,14 @@ final class WebPExpressAvif
         return array(
             '<IfModule mod_rewrite.c>',
             '  RewriteEngine On',
+            '  RewriteCond %{REQUEST_FILENAME} -f',
+            '  RewriteRule (?i)\.avif$ - [E=WE_AVIF_EXISTING:1,L]',
             '  RewriteCond %{REQUEST_FILENAME} !-f',
             '  RewriteRule (?i)^' . $extensionPattern . '$ ' . $realizerPath .
                 ' [' . implode(',', $flags) . ']',
+            '</IfModule>',
+            '<IfModule mod_headers.c>',
+            '  Header set X-WebP-Express-AVIF-Status "existing" env=WE_AVIF_EXISTING',
             '</IfModule>',
             '<IfModule mod_mime.c>',
             '  AddType image/avif .avif',
@@ -1480,6 +1843,9 @@ final class WebPExpressAvif
         $qualitySettings = self::getAvifQualitySettings();
         $flags[] = 'E=WE_AVIF_JPEG_QUALITY:' . $qualitySettings['jpeg_quality'];
         $flags[] = 'E=WE_AVIF_PNG_QUALITY:' . $qualitySettings['png_quality'];
+        if (self::additionalHeadersEnabled()) {
+            $flags[] = 'E=WE_AVIF_ADDITIONAL_HEADERS:1';
+        }
         if (($config['destination-structure'] == 'doc-root') &&
             \WebPExpress\Paths::canUseDocRootForStructuringCacheDir()) {
             $flags[] = 'E=WPCONTENT:' . \WebPExpress\Paths::getContentDirRel();

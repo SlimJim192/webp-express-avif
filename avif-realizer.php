@@ -39,6 +39,11 @@ class AvifRealizer extends WodConfigLoader
         return false;
     }
 
+    private static function additionalHeadersEnabled()
+    {
+        return self::rewriteValue('WE_AVIF_ADDITIONAL_HEADERS') === '1';
+    }
+
     private static function noCache()
     {
         header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
@@ -124,23 +129,30 @@ class AvifRealizer extends WodConfigLoader
             return false;
         }
 
-        foreach ($convertOptions['converters'] as $converter) {
-            if (!is_array($converter) || !isset($converter['converter'])) {
-                continue;
-            }
-            if (($converter['converter'] == 'imagick') &&
-                class_exists('\Imagick') &&
-                method_exists('\Imagick', 'queryFormats')) {
-                try {
-                    if (count(\Imagick::queryFormats('AVIF')) > 0) {
-                        return $converter;
-                    }
-                } catch (\Throwable $e) {
-                    error_log('[WebP Express AVIF] Imagick AVIF capability check failed: ' . $e->getMessage());
+        // Prefer GD because Imagick may ignore its quality setting for AVIF.
+        foreach (array('gd', 'imagick') as $encoderName) {
+            foreach ($convertOptions['converters'] as $converter) {
+                if (!is_array($converter) ||
+                    !isset($converter['converter']) ||
+                    ($converter['converter'] != $encoderName) ||
+                    (!empty($converter['deactivated'])) ||
+                    (isset($converter['working']) && !$converter['working'])) {
+                    continue;
                 }
-            }
-            if (($converter['converter'] == 'gd') && function_exists('imageavif')) {
-                return $converter;
+                if (($encoderName == 'gd') && function_exists('imageavif')) {
+                    return $converter;
+                }
+                if (($encoderName == 'imagick') &&
+                    class_exists('\Imagick') &&
+                    method_exists('\Imagick', 'queryFormats')) {
+                    try {
+                        if (count(\Imagick::queryFormats('AVIF')) > 0) {
+                            return $converter;
+                        }
+                    } catch (\Throwable $e) {
+                        error_log('[WebP Express AVIF] Imagick AVIF capability check failed: ' . $e->getMessage());
+                    }
+                }
             }
         }
         return false;
@@ -292,17 +304,50 @@ class AvifRealizer extends WodConfigLoader
         }
     }
 
-    private static function serve($destination, $options, $varyAccept = false)
+    private static function serve(
+        $destination,
+        $options,
+        $varyAccept = false,
+        $source = null,
+        $quality = null,
+        $status = 'existing',
+        $encoder = null
+    )
     {
         if (!is_readable($destination)) {
             self::fail('Converted AVIF is not readable: ' . $destination);
         }
         header('X-Content-Type-Options: nosniff');
         header('Content-Type: image/avif');
+        header('X-WebP-Express-AVIF-Status: ' . $status);
         if ($varyAccept) {
             header('Vary: Accept', false);
         }
-        header('Content-Length: ' . filesize($destination));
+        $destinationSize = @filesize($destination);
+        if ($destinationSize !== false) {
+            header('Content-Length: ' . $destinationSize);
+        }
+        if (self::additionalHeadersEnabled()) {
+            if (in_array($encoder, array('gd', 'imagick'), true)) {
+                header('X-WebP-Express-AVIF-Encoder: ' . $encoder);
+            }
+            if (is_int($quality) && ($quality >= 0) && ($quality <= 100)) {
+                header('X-WebP-Express-AVIF-Quality: ' . $quality);
+            }
+            if ($destinationSize !== false) {
+                header('X-WebP-Express-AVIF-Output-Bytes: ' . $destinationSize);
+            }
+            if (is_string($source) && is_file($source)) {
+                $sourceSize = @filesize($source);
+                if ($sourceSize !== false) {
+                    header('X-WebP-Express-AVIF-Source-Bytes: ' . $sourceSize);
+                    if (($sourceSize > 0) && ($destinationSize !== false)) {
+                        $savings = (($sourceSize - $destinationSize) / $sourceSize) * 100;
+                        header('X-WebP-Express-AVIF-Savings: ' . number_format($savings, 1, '.', '') . '%');
+                    }
+                }
+            }
+        }
         $modified = filemtime($destination);
         if ($modified !== false) {
             header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $modified) . ' GMT');
@@ -499,7 +544,14 @@ class AvifRealizer extends WodConfigLoader
                     self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
                 }
             } else {
-                self::serve($destination, $options, true);
+                self::serve(
+                    $destination,
+                    $options,
+                    true,
+                    $source,
+                    self::quality($source, $jpegQuality, $pngQuality),
+                    'existing'
+                );
             }
         }
 
@@ -531,7 +583,15 @@ class AvifRealizer extends WodConfigLoader
         )) {
             self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
         }
-        self::serve($destination, $options, true);
+        self::serve(
+            $destination,
+            $options,
+            true,
+            $source,
+            self::quality($source, $jpegQuality, $pngQuality),
+            'converted',
+            $converter['converter']
+        );
     }
 
     public static function processRequest()
@@ -629,7 +689,14 @@ class AvifRealizer extends WodConfigLoader
                         self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
                     }
                 } else {
-                    self::serve($destination, $options);
+                    self::serve(
+                        $destination,
+                        $options,
+                        false,
+                        $source,
+                        self::quality($source, $jpegQuality, $pngQuality),
+                        'existing'
+                    );
                 }
             }
 
@@ -657,7 +724,15 @@ class AvifRealizer extends WodConfigLoader
             )) {
                 self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
             }
-            self::serve($destination, $options);
+            self::serve(
+                $destination,
+                $options,
+                false,
+                $source,
+                self::quality($source, $jpegQuality, $pngQuality),
+                'converted',
+                $converter['converter']
+            );
         } catch (\Throwable $e) {
             self::fail('Realizer error: ' . $e->getMessage(), 500);
         }

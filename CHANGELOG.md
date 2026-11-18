@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.4 - 2026-11-18
+
+- Purge cached AVIF files and refresh rewrite rules when AVIF quality settings
+  change, so subsequent conversions use the selected quality.
+- Add an AVIF status header and optional quality, encoder, source/output size,
+  and file-savings headers.
+- Add optional quality and size diagnostics to PHP-served WebP responses
+  through a helper-owned wrapper, without modifying WebP Express core files.
+- Add a disabled-by-default setting for additional diagnostics, while keeping
+  AVIF status and WebP Express's own serving/conversion headers available.
+- Prefer GD over Imagick when both AVIF encoders are active, and report the
+  encoder used for new conversions.
+
 ## 1.0.3 - 2026-11-18
 
 - Prevent duplicate or colliding AVIF rewrite and MIME blocks, while cleaning
