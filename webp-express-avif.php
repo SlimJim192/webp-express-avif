@@ -3,7 +3,7 @@
  * Plugin Name: WebP Express AVIF
  * Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Description: Adds AVIF support to WebP Express picture tags and varied image responses.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Primary Branch: main
@@ -154,7 +154,7 @@ final class WebPExpressAvif
     private static function renderLiveTests()
     {
         echo '<hr><h2>AVIF live tests</h2>';
-        echo '<p>Run a request against your site to check each AVIF rewrite route. Tests create and remove a temporary JPEG and AVIF in the uploads/cache folders.</p>';
+        echo '<p>Run a request against your site to check each AVIF rewrite route. Tests create and remove a temporary JPEG and AVIF in the uploads/cache folders. They verify the HTTP response because a load-balanced site may create the cache file on another server.</p>';
         echo '<p>';
         echo '<button type="button" class="button" data-webpexpress-avif-test="existing">Test existing AVIF response</button> ';
         echo '<button type="button" class="button" data-webpexpress-avif-test="converter">Test source conversion</button> ';
@@ -238,15 +238,16 @@ final class WebPExpressAvif
         }
 
         $test = isset($_POST['test']) ? sanitize_key(wp_unslash($_POST['test'])) : '';
+        $log = array();
         try {
-            $log = self::runLiveTest($test);
+            self::runLiveTest($test, $log);
             wp_send_json_success(array('log' => $log));
         } catch (\Throwable $e) {
-            wp_send_json_error(array('message' => $e->getMessage()), 400);
+            wp_send_json_error(array('message' => $e->getMessage(), 'log' => $log), 400);
         }
     }
 
-    private static function runLiveTest($test)
+    private static function runLiveTest($test, &$log)
     {
         $config = self::getConfig();
         $testRequirements = array(
@@ -352,6 +353,7 @@ final class WebPExpressAvif
             }
 
             $log[] = 'Request URL: ' . $requestUrl;
+            $log[] = 'Expected AVIF cache file: ' . $destination;
             $response = wp_remote_get(
                 $requestUrl,
                 array(
@@ -383,19 +385,11 @@ final class WebPExpressAvif
                 throw new \RuntimeException('The test request returned an empty response body.');
             }
             if ($test == 'existing') {
-                $currentAvifHash = is_file($destination) ? hash_file('sha256', $destination) : false;
-                if (!is_file($destination) ||
-                    !is_string($currentAvifHash) ||
-                    $currentAvifHash !== $existingAvifHash) {
-                    throw new \RuntimeException('The request did not serve the existing AVIF directly; the cached file changed or disappeared.');
-                }
-            } else {
-                if (!is_file($destination)) {
-                    throw new \RuntimeException('The request returned AVIF but did not create the expected cached AVIF file.');
+                if (hash('sha256', $body) !== $existingAvifHash) {
+                    throw new \RuntimeException('The request did not serve the pre-existing AVIF; it may have converted the changed source instead.');
                 }
             }
             $log[] = 'PASS: received a non-empty AVIF response.';
-            return $log;
         } finally {
             if ($destinationOwned && is_string($destination) && is_file($destination) && !unlink($destination)) {
                 error_log('[WebP Express AVIF] Could not remove live-test AVIF fixture: ' . $destination);
@@ -805,8 +799,8 @@ final class WebPExpressAvif
         }
 
         $file = rtrim($destinationRoot, '/\\') . '/.htaccess';
-        $begin = '# BEGIN WebP Express AVIF MIME';
-        $end = '# END WebP Express AVIF MIME';
+        $begin = '# BEGIN AVIF WebP Express MIME';
+        $end = '# END AVIF WebP Express MIME';
         $rule = $begin . "\n<IfModule mod_mime.c>\nAddType image/avif .avif\n</IfModule>\n" . $end;
         $content = '';
 
@@ -816,9 +810,11 @@ final class WebPExpressAvif
                 error_log('[WebP Express AVIF] Could not read ' . $file . ' to add the AVIF MIME type.');
                 return false;
             }
-            $pattern = '/^' . preg_quote($begin, '/') . '.*?^' . preg_quote($end, '/') . '\s*/ms';
-            if (preg_match($pattern, $content)) {
-                $content = preg_replace($pattern, '', $content);
+            $pattern = '/^# BEGIN (WebP Express AVIF MIME|AVIF WebP Express MIME)\r?\n.*?^# END \1\r?\n?/ms';
+            $content = preg_replace($pattern, '', $content);
+            if (!is_string($content)) {
+                error_log('[WebP Express AVIF] Could not parse AVIF MIME rules in ' . $file);
+                return false;
             }
         }
 
@@ -847,7 +843,7 @@ final class WebPExpressAvif
             return false;
         }
 
-        $pattern = '/^# BEGIN WebP Express AVIF MIME\r?\n.*?^# END WebP Express AVIF MIME\r?\n?/ms';
+        $pattern = '/^# BEGIN (WebP Express AVIF MIME|AVIF WebP Express MIME)\r?\n.*?^# END \1\r?\n?/ms';
         if (!preg_match($pattern, $content)) {
             return true;
         }
@@ -1237,6 +1233,105 @@ final class WebPExpressAvif
                 : array();
             self::saveNegotiationRules($sourceDirectory . '/.htaccess', $sourceRules);
         }
+
+        self::patchUploadOnDemandSourceRule();
+    }
+
+    private static function patchUploadOnDemandSourceRule()
+    {
+        $uploadDirectory = \WebPExpress\Paths::getUploadDirAbs();
+        $filename = rtrim($uploadDirectory, '/\\') . '/.htaccess';
+        if (!is_file($filename)) {
+            return true;
+        }
+        if (is_link($filename)) {
+            error_log('[WebP Express AVIF] Refusing to update a symlinked uploads .htaccess file: ' . $filename);
+            return false;
+        }
+
+        $content = file_get_contents($filename);
+        if ($content === false) {
+            error_log('[WebP Express AVIF] Could not read uploads .htaccess to adjust the WebP source path.');
+            return false;
+        }
+
+        $uploadRootPattern = preg_quote(
+            rtrim(str_replace('\\', '/', $uploadDirectory), '/'),
+            '#'
+        );
+        $ruleFound = false;
+        $conditionFound = false;
+        $changed = false;
+        $coreBlockPattern = '/^# BEGIN WebP Express\r?\n.*?^# END WebP Express\r?\n?/ms';
+        $updated = preg_replace_callback(
+            $coreBlockPattern,
+            function ($matches) use (
+                $uploadRootPattern,
+                &$ruleFound,
+                &$conditionFound,
+                &$changed
+            ) {
+                $lines = preg_split('/(?<=\n)/', $matches[0]);
+                foreach ($lines as $index => $line) {
+                    $rule = rtrim($line, "\r\n");
+                    if ((strpos($rule, 'webp-on-demand.php') === false) ||
+                        (strpos($rule, 'E=WE_SOURCE_REL_HTACCESS:$0') === false) ||
+                        (strpos($rule, 'E=WE_HTACCESS_ID:uploads') === false)) {
+                        continue;
+                    }
+
+                    $ruleFound = true;
+                    if ($index === 0) {
+                        continue;
+                    }
+
+                    $conditionLine = $lines[$index - 1];
+                    $condition = rtrim($conditionLine, "\r\n");
+                    $trimmedCondition = ltrim($condition);
+                    $conditionPrefix = 'RewriteCond %{REQUEST_FILENAME} (?i)(.*)';
+                    if (strpos($trimmedCondition, $conditionPrefix) !== 0) {
+                        continue;
+                    }
+
+                    $suffix = substr($trimmedCondition, strlen($conditionPrefix));
+                    if (!preg_match('/^\((.*)\)\$$/', $suffix, $suffixMatches)) {
+                        continue;
+                    }
+
+                    $indent = substr($condition, 0, strlen($condition) - strlen($trimmedCondition));
+                    $lineEnding = substr($conditionLine, strlen($condition));
+                    $lines[$index - 1] = $indent . 'RewriteCond %{REQUEST_FILENAME} (?i)^' .
+                        $uploadRootPattern . '/((?:.*)(?:' . $suffixMatches[1] . '))$' . $lineEnding;
+                    $lines[$index] = str_replace(
+                        'E=WE_SOURCE_REL_HTACCESS:$0',
+                        'E=WE_SOURCE_REL_HTACCESS:%1',
+                        $lines[$index]
+                    );
+                    $conditionFound = true;
+                    $changed = true;
+                }
+
+                return implode('', $lines);
+            },
+            $content
+        );
+
+        if (!is_string($updated)) {
+            error_log('[WebP Express AVIF] Could not parse the WebP Express uploads rules.');
+            return false;
+        }
+        if (!$ruleFound || !$changed) {
+            if ($ruleFound && !$conditionFound) {
+                error_log('[WebP Express AVIF] Could not locate the image condition for the uploads converter rule.');
+                return false;
+            }
+            return true;
+        }
+        if (file_put_contents($filename, $updated, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write the adjusted WebP source rule to uploads .htaccess.');
+            return false;
+        }
+        return true;
     }
 
     public static function syncRewriteRulesBeforeSettingsRedirect($location, $status)
@@ -1417,7 +1512,7 @@ final class WebPExpressAvif
             $content = '';
         }
 
-        $markerPattern = '/^# BEGIN WebP Express AVIF Negotiation\r?\n.*?^# END WebP Express AVIF Negotiation\r?\n?/ms';
+        $markerPattern = '/^# BEGIN (WebP Express AVIF Negotiation|AVIF WebP Express Negotiation)\r?\n.*?^# END \1\r?\n?/ms';
         $contentWithoutRules = preg_replace($markerPattern, '', $content, -1, $removed);
         if (!is_string($contentWithoutRules)) {
             error_log('[WebP Express AVIF] Could not parse negotiation rules in ' . $filename);
@@ -1429,9 +1524,9 @@ final class WebPExpressAvif
 
         $updated = $contentWithoutRules;
         if (!empty($rules)) {
-            $block = "# BEGIN WebP Express AVIF Negotiation\n" .
+            $block = "# BEGIN AVIF WebP Express Negotiation\n" .
                 implode("\n", $rules) .
-                "\n# END WebP Express AVIF Negotiation\n";
+                "\n# END AVIF WebP Express Negotiation\n";
             if (preg_match('/^# BEGIN WebP Express\r?$/m', $contentWithoutRules, $matches, PREG_OFFSET_CAPTURE)) {
                 $offset = $matches[0][1];
                 $prefix = substr($contentWithoutRules, 0, $offset);
@@ -1460,36 +1555,68 @@ final class WebPExpressAvif
     private static function saveRewriteRules($filename, $rules, $createDirectory)
     {
         $directory = dirname($filename);
-        $marker = '# BEGIN WebP Express AVIF';
-        if (empty($rules)) {
-            if (!is_file($filename)) {
-                return true;
-            }
-            $content = file_get_contents($filename);
-            if ($content === false) {
-                error_log('[WebP Express AVIF] Could not read ' . $filename . ' to remove stale rules.');
-                return false;
-            }
-            if (strpos($content, $marker) === false) {
-                return true;
-            }
+        if (empty($rules) && !is_file($filename)) {
+            return true;
         }
-
         if (!is_dir($directory)) {
             if (!$createDirectory || !wp_mkdir_p($directory)) {
                 error_log('[WebP Express AVIF] Could not create rewrite-rule directory: ' . $directory);
                 return false;
             }
         }
+        if (is_link($filename)) {
+            error_log('[WebP Express AVIF] Refusing to update a symlinked rewrite rules file: ' . $filename);
+            return false;
+        }
 
-        if (!function_exists('insert_with_markers')) {
-            require_once ABSPATH . 'wp-admin/includes/misc.php';
+        if (is_file($filename)) {
+            $content = file_get_contents($filename);
+            if ($content === false) {
+                error_log('[WebP Express AVIF] Could not read ' . $filename . ' to update rewrite rules.');
+                return false;
+            }
+        } else {
+            $content = '';
         }
-        $result = insert_with_markers($filename, 'WebP Express AVIF', $rules);
-        if (!$result) {
-            error_log('[WebP Express AVIF] Could not update Apache rewrite rules in ' . $filename);
+
+        $markerPattern = '/^# BEGIN (WebP Express AVIF|AVIF WebP Express Rewrite)\r?\n.*?^# END \1\r?\n?/ms';
+        $contentWithoutRules = preg_replace($markerPattern, '', $content, -1, $removed);
+        if (!is_string($contentWithoutRules)) {
+            error_log('[WebP Express AVIF] Could not parse rewrite rules in ' . $filename);
+            return false;
         }
-        return $result;
+        if (empty($rules) && ($removed === 0)) {
+            return true;
+        }
+
+        $updated = $contentWithoutRules;
+        if (!empty($rules)) {
+            $block = "# BEGIN AVIF WebP Express Rewrite\n" .
+                implode("\n", $rules) .
+                "\n# END AVIF WebP Express Rewrite\n";
+            if (preg_match('/^# BEGIN WebP Express\r?$/m', $contentWithoutRules, $matches, PREG_OFFSET_CAPTURE)) {
+                $offset = $matches[0][1];
+                $prefix = substr($contentWithoutRules, 0, $offset);
+                if (($prefix != '') && !preg_match('/(?:\r\n|\r|\n)$/', $prefix)) {
+                    $prefix .= "\n";
+                }
+                $updated = $prefix . $block . substr($contentWithoutRules, $offset);
+            } else {
+                $separator = ($contentWithoutRules == '' || preg_match('/(?:\r\n|\r|\n)$/', $contentWithoutRules))
+                    ? ''
+                    : "\n";
+                $updated = $contentWithoutRules . $separator . $block;
+            }
+        }
+
+        if ($updated === $content) {
+            return true;
+        }
+        if (file_put_contents($filename, $updated, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write Apache rewrite rules in ' . $filename);
+            return false;
+        }
+        return true;
     }
 
     private static function maybeConvertOnUpload($source)

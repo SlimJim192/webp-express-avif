@@ -480,8 +480,8 @@ class AvifRealizer extends WodConfigLoader
         }
 
         if ($preventLarger &&
-            is_file(\WebPExpress\Paths::getBiggerThanSourceDirAbs() .
-                '/' . $sourceRootId . '/' . $sourceRelative . '.webp')) {
+            is_file(rtrim(self::$webExpressContentDirAbs, '/\\') .
+                '/webp-images-bigger-than-source/' . $sourceRootId . '/' . $sourceRelative . '.webp')) {
             self::serveOriginal($source, $options);
         }
 

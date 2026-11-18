@@ -29,6 +29,8 @@ regenerated with the new quality.
 The page also provides live checks for the existing-AVIF varied response,
 source-to-converter, and picture-tag realizer routes. They require JPEG images
 in the uploads scope and the corresponding WebP Express redirection settings.
+The checks validate the HTTP response; a load-balanced site may create a
+derivative on a different server than the one running the test.
 
 ## How it works
 
@@ -54,6 +56,10 @@ and are refreshed from the WebP Express settings page; WebP Express can
 regenerate its own rules without removing the AVIF rules. Deactivating this
 plugin removes its marked rewrite and MIME blocks without deleting generated
 AVIF files.
+For uploads using image-roots, the helper also adjusts WebP Express's generated
+on-demand rule when Apache passes an absolute source path, so the converter
+receives a path relative to the uploads root without requiring a core-plugin
+edit.
 
 After upgrading from a version that generated AVIF files without public-read
 permissions, use WebP Express's "Delete converted files" button once so the

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.3 - 2026-11-18
+
+- Prevent duplicate or colliding AVIF rewrite and MIME blocks, while cleaning
+  up blocks created by earlier versions.
+- Adjust the generated uploads converter rule for image-root setups where
+  Apache supplies an absolute source path, without modifying WebP Express core.
+- Correct the AVIF check for WebP files larger than their source.
+- Improve AVIF live-test diagnostics and validate responses on load-balanced
+  sites.
+
 ## 1.0.2 - 2026-11-17
 
 - Add AVIF live tests for cached varied responses, on-demand conversion, and the

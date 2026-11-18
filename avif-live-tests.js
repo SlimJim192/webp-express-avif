@@ -32,12 +32,15 @@
                             var message = result.data && result.data.message
                                 ? result.data.message
                                 : 'The AVIF live test failed.';
-                            throw new Error(message);
+                            var log = result.data && Array.isArray(result.data.log)
+                                ? result.data.log.join('\n') + '\n'
+                                : '';
+                            throw new Error(log + 'FAIL: ' + message);
                         }
                         output.textContent = result.data.log.join('\n');
                     });
                 }).catch(function (error) {
-                    output.textContent = 'FAIL: ' + error.message;
+                    output.textContent = error.message;
                 }).then(function () {
                     buttons.forEach(function (item) {
                         item.disabled = false;
