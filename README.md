@@ -50,31 +50,50 @@ Express's scope, destination folder, extension, and structure settings.
 For mingled destinations, the AVIF extension is appended to the WebP filename
 (for example, `image.jpg.webp.avif`) to avoid overwriting existing AVIF images.
 
-Apache cache-miss rules route AVIF requests directly to this plugin's standalone
-realizer, following WebP Express's own `.htaccess` realizer pattern. The realizer
-loads WebP Express's saved WOD settings without bootstrapping WordPress, checks
-the requested destination against WebP Express's image roots and scope, and
-converts only the corresponding JPEG or PNG source. Picture-tag cache-miss rules
-are installed in the WebP Express cache directory and, for mingled uploads, the
-uploads directory. Varied-response rules are installed before WebP Express's
-rules in each selected source image root, so AVIF negotiation takes precedence
-only for requests advertising `image/avif`. The rules use separate marker blocks
-and are refreshed from the WebP Express settings page; WebP Express can
-regenerate its own rules without removing the AVIF rules. Deactivating this
-plugin removes its marked rewrite and MIME blocks without deleting generated
-AVIF files.
+Apache serves existing varied-response AVIF cache files directly, following
+WebP Express's cache-first delivery pattern. When the larger-file safeguard is
+enabled, AVIFs are size-checked before they are moved into the cache, so any
+cached AVIF is safe to serve. Switching the safeguard on purges the AVIF cache,
+so AVIFs made without the check are regenerated.
+
+Two markers next to the AVIF destination let later varied requests continue
+through WebP Express's own rules instead of retrying AVIF conversion in PHP:
+`.we-avif-too-large` when the AVIF was at least as large as its source, and
+`.we-avif-failure` when conversion failed. The failure marker records the time,
+source, encoder and reason. Sources that WebP Express itself has recorded as
+producing larger WebPs are handed back too. A cached WebP or original can then be
+served directly; a WebP cache miss may still use WebP Express's PHP converter.
+Markers are removed when the source is re-uploaded or deleted, on bulk
+conversion, and by any AVIF cache purge, after which conversion is retried.
+
+Cache misses route to this plugin's standalone realizer, following WebP
+Express's own `.htaccess` realizer pattern. The realizer loads WebP Express's
+saved WOD settings without bootstrapping WordPress, checks the requested
+destination against WebP Express's image roots and scope, and converts only the
+corresponding JPEG or PNG source. Picture-tag cache-miss rules are installed in
+the WebP Express cache directory and, for mingled uploads, the uploads
+directory. Varied-response rules are installed before WebP Express's rules in
+each selected source image root, so AVIF negotiation takes precedence only for
+requests advertising `image/avif`. The rules use separate marker blocks and are
+refreshed from the WebP Express settings page; WebP Express can regenerate its
+own rules without removing the AVIF rules. Deactivating this plugin removes its
+marked rewrite and MIME blocks without deleting generated AVIF files.
 For uploads using image-roots, the helper also adjusts WebP Express's generated
 on-demand rule when Apache passes an absolute source path, so the converter
 receives a path relative to the uploads root without requiring a core-plugin
 edit.
-Responses served by the AVIF realizer always include
-`X-WebP-Express-AVIF-Status` (`converted` or `existing`). When additional
-diagnostic headers are enabled, they also include `X-WebP-Express-AVIF-Quality`,
-source/output byte counts, and a size-savings percentage. Newly converted
-responses also include `X-WebP-Express-AVIF-Encoder` (`gd` or `imagick`).
-Existing files served directly by Apache include the `existing` status header;
-quality and size metrics are available only on realizer-served responses and
-when the additional-header option is enabled.
+AVIF responses include an `X-WebP-Express-AVIF` header worded like WebP
+Express's own `X-WebP-Express` header:
+
+- `Redirected directly to existing avif`: served by Apache from the cache.
+- `Served existing avif by realizer`: a cached AVIF served by the realizer.
+- `Converted to avif by realizer`: converted and served on this request.
+
+When additional diagnostic headers are enabled, realizer responses also include
+`X-WebP-Express-AVIF-Quality`, source/output byte counts, and a size-savings
+percentage, and newly converted responses include `X-WebP-Express-AVIF-Encoder`
+(`gd` or `imagick`). These record what the encoder actually produced, so they
+are not sent on responses Apache serves directly.
 
 WebP responses also receive diagnostics from the helper plugin. The helper
 routes WebP Express's PHP realizer requests through its own response wrapper,
@@ -126,3 +145,5 @@ mode.
 
 WebP Express settings saves, including forced rewrite-rule updates, refresh this
 plugin's separate Apache rewrite blocks without replacing WebP Express's rules.
+The WebP Express cache purge and AVIF quality-change purge also remove the
+helper's AVIF cache-validation and size-rejection markers.

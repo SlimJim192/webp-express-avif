@@ -3,7 +3,7 @@
  * Plugin Name: WebP Express AVIF
  * Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Description: Adds AVIF support to WebP Express picture tags and varied image responses.
- * Version: 1.0.4
+ * Version: 1.0.5
  * Author: Ncomp@ss
  * GitHub Plugin URI: https://github.com/SlimJim192/webp-express-avif
  * Primary Branch: main
@@ -186,43 +186,67 @@ final class WebPExpressAvif
             return;
         }
 
-        $counts = array('delete-count' => 0, 'fail-count' => 0);
-        $config = self::getConfig();
+        self::purgeAllAvifFiles(self::getConfig(), 'AVIF quality settings saved');
+        self::syncRewriteRules();
+    }
+
+    /**
+     * Removes every cached AVIF and marker, and queues an admin notice with the counts.
+     */
+    private static function purgeAllAvifFiles($config, $reason)
+    {
+        $counts = array('delete-count' => 0, 'fail-count' => 0, 'reason' => $reason);
         if (!is_array($config) || !isset($config['destination-folder'])) {
-            error_log('[WebP Express AVIF] Cannot purge AVIF files after a quality change: WebP Express destination settings are unavailable.');
+            error_log('[WebP Express AVIF] Cannot purge AVIF files (' . $reason . '): WebP Express destination settings are unavailable.');
             $counts['fail-count']++;
         } else {
-            $mingled = ($config['destination-folder'] == 'mingled');
-            if ($mingled) {
-                self::purgeAvifFiles(
-                    \WebPExpress\Paths::getUploadDirAbs(),
-                    $config,
-                    false,
-                    true,
-                    $counts
-                );
+            if ($config['destination-folder'] == 'mingled') {
+                self::purgeAvifFiles(\WebPExpress\Paths::getUploadDirAbs(), $config, false, true, $counts);
             }
-            self::purgeAvifFiles(
-                \WebPExpress\Paths::getCacheDirAbs(),
-                $config,
-                false,
-                $mingled,
-                $counts
-            );
+            self::purgeAvifFiles(\WebPExpress\Paths::getCacheDirAbs(), $config, false, false, $counts);
         }
 
         if ($counts['fail-count'] > 0) {
             error_log(
-                '[WebP Express AVIF] Quality changed; ' . $counts['delete-count'] .
+                '[WebP Express AVIF] ' . $reason . '; ' . $counts['delete-count'] .
                 ' cached AVIF file(s) removed and ' . $counts['fail-count'] .
                 ' could not be removed.'
             );
         }
 
-        self::syncRewriteRules();
         $noticeKey = 'webpexpress_avif_quality_purge_' . get_current_user_id();
         set_transient($noticeKey, $counts, 5 * MINUTE_IN_SECONDS);
+        return $counts;
     }
+
+    /**
+     * Apache serves any cached AVIF directly, so every cached AVIF must have passed
+     * the size check. AVIFs made while WebP Express's "prevent larger" setting was
+     * off were not checked, so purge when that setting is switched on.
+     */
+    private static function purgeAvifCacheIfSizeCheckEnabled($config)
+    {
+        if (!is_array($config)) {
+            return;
+        }
+        $preventLarger = !empty($config['prevent-using-webps-larger-than-original']);
+        $previous = get_option('webpexpress_avif_prevent_larger', null);
+        if ($previous !== null && (bool) $previous === $preventLarger) {
+            return;
+        }
+
+        // Save first so a slow or failing purge is not repeated on every admin page.
+        update_option('webpexpress_avif_prevent_larger', $preventLarger ? 1 : 0);
+        // The first run only records the setting; it is not an upgrade purge.
+        if ($previous === null || !$preventLarger) {
+            return;
+        }
+        $counts = self::purgeAllAvifFiles($config, 'WebP Express "prevent larger" setting enabled');
+        if (($counts['delete-count'] == 0) && ($counts['fail-count'] == 0)) {
+            delete_transient('webpexpress_avif_quality_purge_' . get_current_user_id());
+        }
+    }
+
 
     public static function addSettingsPage()
     {
@@ -267,7 +291,10 @@ final class WebPExpressAvif
         $deleted = isset($counts['delete-count']) ? intval($counts['delete-count']) : 0;
         $failed = isset($counts['fail-count']) ? intval($counts['fail-count']) : 0;
         $class = ($failed > 0) ? 'notice-warning' : 'notice-success';
-        $message = 'AVIF quality settings saved; ' . $deleted . ' cached AVIF file(s) removed.';
+        $reason = isset($counts['reason']) && is_string($counts['reason'])
+            ? $counts['reason']
+            : 'AVIF quality settings saved';
+        $message = $reason . '; ' . $deleted . ' cached AVIF file(s) removed.';
         if ($failed > 0) {
             $message .= ' ' . $failed . ' file(s) could not be removed; check the PHP error log.';
         } else {
@@ -932,6 +959,12 @@ final class WebPExpressAvif
         }
 
         try {
+            // libgd's AVIF encoder rejects palette images (common for small PNGs).
+            if (!imageistruecolor($image) && !imagepalettetotruecolor($image)) {
+                throw new \RuntimeException('GD could not convert a palette image to truecolor.');
+            }
+            imagealphablending($image, false);
+            imagesavealpha($image, true);
             return imageavif($image, $temporaryFile, $quality) &&
                 is_file($temporaryFile) &&
                 (filesize($temporaryFile) > 0);
@@ -1029,11 +1062,86 @@ final class WebPExpressAvif
                 ($destinationSize < $sourceSize);
         }
 
+        if (!$isCurrent) {
+            // An explicit conversion is a retry: clear earlier outcomes first.
+            self::removeAvifTooLargeMarker($destination);
+            self::removeAvifFailureMarker($destination);
+        }
+
         $success = self::writeAvifFile($source, $destination, $config, $destinationRoot);
+        if ($success) {
+            self::removeAvifTooLargeMarker($destination);
+            self::removeAvifFailureMarker($destination);
+        }
         if ($writeLog && !$isCurrent) {
             self::logAvifConversion($source, $destination, $success);
         }
         return $success;
+    }
+
+    private static function markAvifTooLarge($destination)
+    {
+        $marker = $destination . '.we-avif-too-large';
+        if (is_file($marker)) {
+            return true;
+        }
+        if (@file_put_contents($marker, '', LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not mark an AVIF as larger than its source: ' . $destination);
+            return false;
+        }
+        return true;
+    }
+
+    private static function removeAvifTooLargeMarker($destination)
+    {
+        $marker = $destination . '.we-avif-too-large';
+        if (is_file($marker) && !@unlink($marker)) {
+            error_log('[WebP Express AVIF] Could not remove an AVIF size-rejection marker: ' . $marker);
+            return false;
+        }
+        return true;
+    }
+
+    private static function markAvifFailed($destination, $source, $encoder, $reason)
+    {
+        $marker = $destination . '.we-avif-failure';
+        $clean = function ($value) {
+            return preg_replace('/[\r\n\x00-\x1f\x7f]+/', ' ', (string) $value);
+        };
+        $contents = 'time: ' . gmdate('c') . "\n" .
+            'source: ' . $clean($source) . "\n" .
+            'encoder: ' . (($encoder != '') ? $clean($encoder) : 'none') . "\n" .
+            'context: WordPress (upload or bulk conversion)' . "\n" .
+            'reason: ' . $clean($reason) . "\n";
+        if (!is_dir(dirname($marker))) {
+            return false;
+        }
+        if (@file_put_contents($marker, $contents, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write an AVIF failure marker: ' . $marker);
+            return false;
+        }
+        return true;
+    }
+
+    private static function removeAvifFailureMarker($destination)
+    {
+        $marker = $destination . '.we-avif-failure';
+        if (is_file($marker) && !@unlink($marker)) {
+            error_log('[WebP Express AVIF] Could not remove an AVIF failure marker: ' . $marker);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Logs a conversion failure, records it in the failure marker so Apache hands
+     * later requests to WebP Express, and returns false for the caller.
+     */
+    private static function conversionFailed($source, $destination, $encoder, $reason)
+    {
+        error_log('[WebP Express AVIF] ' . $reason . ': ' . $destination);
+        self::markAvifFailed($destination, $source, $encoder, $reason);
+        return false;
     }
 
     private static function writeAvifFile($source, $destination, $config, $destinationRoot)
@@ -1042,6 +1150,7 @@ final class WebPExpressAvif
             !empty($config['prevent-using-webps-larger-than-original']) &&
             (filesize($destination) >= filesize($source))) {
             error_log('[WebP Express AVIF] Skipping AVIF that is larger than its source: ' . $destination);
+            self::markAvifTooLarge($destination);
             if (!unlink($destination)) {
                 error_log('[WebP Express AVIF] Could not remove an AVIF that was larger than its source: ' . $destination);
             }
@@ -1057,31 +1166,41 @@ final class WebPExpressAvif
         }
 
         $success = false;
+        $attempted = array();
+        $failures = array();
         try {
             foreach (self::activeAvifConverters($config) as $converter) {
                 $quality = self::qualityForSource($source);
+                $name = $converter['converter'];
                 try {
                     if (is_file($temporaryFile) && (file_put_contents($temporaryFile, '') === false)) {
                         error_log('[WebP Express AVIF] Could not clear temporary conversion file: ' . $temporaryFile);
+                        $failures[] = $name . ': could not clear the temporary file';
                         continue;
                     }
-                    if (($converter['converter'] == 'imagick') && self::imagickSupportsAvif()) {
+                    error_clear_last();
+                    if (($name == 'imagick') && self::imagickSupportsAvif()) {
+                        $attempted[] = $name;
                         $success = self::convertWithImagick(
                             $source,
                             $temporaryFile,
                             $quality,
                             isset($config['metadata']) ? $config['metadata'] : 'none'
                         );
-                    } elseif (($converter['converter'] == 'gd') && function_exists('imageavif')) {
+                    } elseif (($name == 'gd') && function_exists('imageavif')) {
+                        $attempted[] = $name;
                         $success = self::convertWithGd($source, $temporaryFile, $quality);
                     } else {
                         continue;
                     }
-                } catch (\Exception $e) {
-                    error_log('[WebP Express AVIF] ' . $converter['converter'] . ' conversion failed: ' . $e->getMessage());
-                    $success = false;
+                    if (!$success) {
+                        $phpError = error_get_last();
+                        $failures[] = $name . ': no AVIF output' .
+                            ((is_array($phpError) && isset($phpError['message'])) ? ' (' . $phpError['message'] . ')' : '');
+                    }
                 } catch (\Throwable $e) {
-                    error_log('[WebP Express AVIF] ' . $converter['converter'] . ' conversion failed: ' . $e->getMessage());
+                    error_log('[WebP Express AVIF] ' . $name . ' conversion failed: ' . $e->getMessage());
+                    $failures[] = $name . ': ' . $e->getMessage();
                     $success = false;
                 }
 
@@ -1091,7 +1210,24 @@ final class WebPExpressAvif
             }
 
             if (!$success) {
-                error_log('[WebP Express AVIF] No active Imagick/GD converter could create AVIF for ' . $source);
+                return self::conversionFailed(
+                    $source,
+                    $destination,
+                    implode(',', $attempted),
+                    empty($failures)
+                        ? 'No active Imagick/GD converter could create AVIF'
+                        : 'AVIF conversion failed: ' . implode('; ', $failures)
+                );
+            }
+
+            // Check the size before the AVIF is moved into place, so Apache never
+            // sees an oversized AVIF in the cache.
+            clearstatcache(true, $temporaryFile);
+            if (!empty($config['prevent-using-webps-larger-than-original']) &&
+                (filesize($temporaryFile) >= filesize($source))) {
+                error_log('[WebP Express AVIF] Skipping AVIF that is larger than its source: ' . $destination);
+                self::removeAvifFailureMarker($destination);
+                self::markAvifTooLarge($destination);
                 return false;
             }
 
@@ -1103,17 +1239,13 @@ final class WebPExpressAvif
             }
             if (!@rename($temporaryFile, $destination)) {
                 if (!is_file($destination) || (filemtime($destination) < filemtime($source))) {
-                    error_log('[WebP Express AVIF] Could not move the converted file into place: ' . $destination);
-                    return false;
+                    return self::conversionFailed(
+                        $source,
+                        $destination,
+                        implode(',', $attempted),
+                        'Could not move the converted AVIF into place'
+                    );
                 }
-            }
-            if (!empty($config['prevent-using-webps-larger-than-original']) &&
-                (filesize($destination) >= filesize($source))) {
-                error_log('[WebP Express AVIF] Skipping AVIF that is larger than its source: ' . $destination);
-                if (!unlink($destination)) {
-                    error_log('[WebP Express AVIF] Could not remove an AVIF that was larger than its source: ' . $destination);
-                }
-                return false;
             }
             return true;
         } finally {
@@ -1340,6 +1472,7 @@ final class WebPExpressAvif
 
         self::$config = null;
         $config = self::getConfig();
+        self::purgeAvifCacheIfSizeCheckEnabled($config);
         $enabled = self::pictureModeEnabled($config) &&
             self::hasActiveAvifEncoder($config) &&
             !empty($config['enable-redirection-to-webp-realizer']) &&
@@ -1353,6 +1486,14 @@ final class WebPExpressAvif
             return;
         }
 
+        $variedEnabled = self::variedImageModeEnabled($config) &&
+            self::hasActiveAvifEncoder($config) &&
+            (!empty($config['enable-redirection-to-converter']) ||
+                !empty($config['redirect-to-existing-in-htaccess'])) &&
+            isset($config['scope']) &&
+            is_array($config['scope']) &&
+            !empty($config['image-types']);
+
         $cacheRules = array();
         $uploadsRules = array();
         if ($enabled) {
@@ -1363,20 +1504,18 @@ final class WebPExpressAvif
                 $uploadsRules = self::rewriteRulesFor('uploads', $realizerPath, $config);
             }
         }
+        if ($variedEnabled) {
+            // Directly served varied AVIFs are internal redirects into the cache
+            // dir, so headers must be set by the .htaccess there (as WebP Express
+            // does for WebP); the source-dir block does not apply to them.
+            $cacheRules = array_merge($cacheRules, self::variedCacheHeaderRules());
+        }
 
         self::saveRewriteRules(\WebPExpress\Paths::getCacheDirAbs() . '/.htaccess', $cacheRules, true);
         $uploadDirectory = \WebPExpress\Paths::getUploadDirAbs();
         if (is_dir($uploadDirectory)) {
             self::saveRewriteRules($uploadDirectory . '/.htaccess', $uploadsRules, false);
         }
-
-        $variedEnabled = self::variedImageModeEnabled($config) &&
-            self::hasActiveAvifEncoder($config) &&
-            (!empty($config['enable-redirection-to-converter']) ||
-                !empty($config['redirect-to-existing-in-htaccess'])) &&
-            isset($config['scope']) &&
-            is_array($config['scope']) &&
-            !empty($config['image-types']);
         foreach (\WebPExpress\Paths::getImageRootIds() as $rootId) {
             $sourceDirectory = \WebPExpress\Paths::getAbsDirById($rootId);
             if (!is_string($sourceDirectory) || !is_dir($sourceDirectory)) {
@@ -1390,6 +1529,33 @@ final class WebPExpressAvif
 
         self::patchUploadOnDemandSourceRule();
         self::syncWebPDiagnosticsRules();
+    }
+
+    private static function variedCacheHeaderRules()
+    {
+        return self::existingAvifHeaderRules(false);
+    }
+
+    /**
+     * Headers for AVIFs Apache serves directly. The diagnostic headers (quality,
+     * encoder, sizes) record what the encoder actually did, so only the realizer
+     * sends them, on the request that converts the image.
+     */
+    private static function existingAvifHeaderRules($varyAlways)
+    {
+        return array(
+            '<IfModule mod_setenvif.c>',
+            '  # Apache prefixes rewrite env vars with REDIRECT_ after an internal redirect.',
+            '  SetEnvIf REDIRECT_WE_AVIF_EXISTING 1 WE_AVIF_EXISTING=1',
+            '</IfModule>',
+            '<IfModule mod_headers.c>',
+            '  Header set X-WebP-Express-AVIF "Redirected directly to existing avif" env=WE_AVIF_EXISTING',
+            $varyAlways ? '  Header merge Vary "Accept"' : '  Header merge Vary "Accept" env=WE_AVIF_EXISTING',
+            '</IfModule>',
+            '<IfModule mod_mime.c>',
+            '  AddType image/avif .avif',
+            '</IfModule>'
+        );
     }
 
     private static function patchUploadOnDemandSourceRule()
@@ -1767,6 +1933,9 @@ final class WebPExpressAvif
     private static function rewriteRulesFor($rootId, $realizerPath, $config)
     {
         $extensionPattern = ($rootId == 'uploads') ? '(.+\.webp\.avif)' : '(.+\.avif)';
+        $webpFallbackPattern = ($rootId == 'uploads')
+            ? '(?i)^(.+)\.webp\.avif$'
+            : '(?i)^(.+)\.avif$';
         $flags = array_merge(array(
             'E=WE_DESTINATION_REL_HTACCESS:$1',
             'E=WE_HTACCESS_ID:' . $rootId,
@@ -1775,7 +1944,7 @@ final class WebPExpressAvif
         $flags[] = 'NC';
         $flags[] = 'L';
 
-        return array(
+        $rules = array(
             '<IfModule mod_rewrite.c>',
             '  RewriteEngine On',
             '  RewriteCond %{REQUEST_FILENAME} -f',
@@ -1785,12 +1954,26 @@ final class WebPExpressAvif
                 ' [' . implode(',', $flags) . ']',
             '</IfModule>',
             '<IfModule mod_headers.c>',
-            '  Header set X-WebP-Express-AVIF-Status "existing" env=WE_AVIF_EXISTING',
+            '  Header set X-WebP-Express-AVIF "Redirected directly to existing avif" env=WE_AVIF_EXISTING',
             '</IfModule>',
             '<IfModule mod_mime.c>',
             '  AddType image/avif .avif',
             '</IfModule>'
         );
+        $fallbackConds = array('  RewriteCond %{REQUEST_FILENAME}.we-avif-failure -f');
+        if (!empty($config['prevent-using-webps-larger-than-original'])) {
+            $fallbackConds = array(
+                '  RewriteCond %{REQUEST_FILENAME}.we-avif-failure -f [OR]',
+                '  RewriteCond %{REQUEST_FILENAME}.we-avif-too-large -f'
+            );
+        }
+        array_splice($rules, 2, 0, array_merge($fallbackConds, array(
+            // Use the URL path, not the RewriteRule match, which some servers
+            // supply as an absolute filesystem path.
+            '  RewriteCond %{REQUEST_URI} "' . $webpFallbackPattern . '"',
+            '  RewriteRule . %1.webp [R=302,L]'
+        )));
+        return $rules;
     }
 
     private static function variedRewriteRulesFor($rootId, $realizerPath, $config)
@@ -1806,6 +1989,7 @@ final class WebPExpressAvif
             return array();
         }
 
+        $staticRules = self::variedStaticRewriteRulesFor($rootId, $extensions, $config);
         $flags = array_merge(array(
             'E=WE_AVIF_MODE:varied',
             'E=WE_AVIF_SOURCE_REL:$0',
@@ -1816,9 +2000,10 @@ final class WebPExpressAvif
         $flags[] = 'NC';
         $flags[] = 'L';
 
-        return array(
+        $rules = array(
             '<IfModule mod_rewrite.c>',
             '  RewriteEngine On',
+            '  RewriteCond %{ENV:WE_AVIF_NO_AVIF} !1',
             '  RewriteCond %{QUERY_STRING} !dontreplace$',
             '  RewriteCond %{QUERY_STRING} !original$',
             '  RewriteCond %{HTTP_ACCEPT} image/avif [NC]',
@@ -1830,6 +2015,104 @@ final class WebPExpressAvif
                 ' [' . implode(',', $flags) . ']',
             '</IfModule>'
         );
+        array_splice($rules, 2, 0, $staticRules);
+        // Mingled AVIFs live in the source dir, so this block also sets their
+        // headers. Originals here vary on Accept too, so Vary is unconditional.
+        return array_merge($rules, self::existingAvifHeaderRules(true));
+    }
+
+    private static function variedStaticRewriteRulesFor($rootId, $extensions, $config)
+    {
+        if (!class_exists('\WebPExpress\DestinationOptions') ||
+            !method_exists('\WebPExpress\Paths', 'destinationRoot')) {
+            error_log('[WebP Express AVIF] Cannot generate direct AVIF cache rules without WebP Express destination helpers.');
+            return array();
+        }
+
+        $sourceRoot = \WebPExpress\Paths::getAbsDirById($rootId);
+        $destinationOptions = \WebPExpress\DestinationOptions::createFromConfig($config);
+        $destinationRoot = \WebPExpress\Paths::destinationRoot($rootId, $destinationOptions);
+        if (!is_string($sourceRoot) || !is_array($destinationRoot) ||
+            !isset($destinationRoot['abs-path'], $destinationRoot['url']) ||
+            !is_string($destinationRoot['abs-path']) || !is_string($destinationRoot['url'])) {
+            error_log('[WebP Express AVIF] Cannot determine source and AVIF cache paths for direct cache rules.');
+            return array();
+        }
+
+        $sourceRoot = rtrim(str_replace('\\', '/', $sourceRoot), '/');
+        $destinationRootAbs = rtrim(str_replace('\\', '/', $destinationRoot['abs-path']), '/');
+        if (preg_match('/["\r\n\x00]/', $sourceRoot . $destinationRootAbs)) {
+            error_log('[WebP Express AVIF] Cannot generate direct AVIF cache rules for paths containing unsupported characters.');
+            return array();
+        }
+
+        $destinationUrlPath = \WebPExpress\Paths::getUrlPathFromUrl($destinationRoot['url']);
+        if (!is_string($destinationUrlPath)) {
+            error_log('[WebP Express AVIF] Cannot determine the URL path for direct AVIF cache rules.');
+            return array();
+        }
+        $destinationUrlPath = '/' . trim($destinationUrlPath, '/');
+
+        $mingledUploads = ($config['destination-folder'] == 'mingled') && ($rootId == 'uploads');
+        $setsExtension = $mingledUploads && ($config['destination-extension'] == 'set');
+        $destinationSuffix = $mingledUploads ? '.webp.avif' : '.avif';
+        $sourcePathPattern = $setsExtension
+            ? '%1.webp.avif'
+            : '%1.%2' . $destinationSuffix;
+        $sourceRegex = '^' . preg_quote($sourceRoot, '#') .
+            '/(.*)\.(' . implode('|', $extensions) . ')$';
+        $destinationPath = $destinationRootAbs . '/' . $sourcePathPattern;
+        // Build the target from the RewriteCond captures (%1/%2), as WebP Express
+        // does. Some servers pass an absolute filesystem path to per-directory
+        // RewriteRule patterns, so $1 cannot be relied on to be root-relative.
+        $destinationUrl = $destinationUrlPath . '/' . $sourcePathPattern;
+        // Files whose presence means "no AVIF for this source": hand those requests
+        // to WebP Express so Apache serves its WebP/original without PHP.
+        $handBackFiles = array($destinationPath . '.we-avif-failure');
+        if (!empty($config['prevent-using-webps-larger-than-original'])) {
+            $handBackFiles[] = $destinationPath . '.we-avif-too-large';
+            if (method_exists('\WebPExpress\Paths', 'getBiggerThanSourceDirAbs')) {
+                $biggerThanSourcePath = rtrim(str_replace('\\', '/', \WebPExpress\Paths::getBiggerThanSourceDirAbs()), '/') .
+                    '/' . $rootId . '/%1.%2.webp';
+                if (!preg_match('/["\r\n\x00]/', $biggerThanSourcePath)) {
+                    // WebP Express serves these originals directly through Apache.
+                    $handBackFiles[] = $biggerThanSourcePath;
+                }
+            }
+        }
+        $handBackConds = array();
+        foreach ($handBackFiles as $index => $file) {
+            $isLast = ($index == count($handBackFiles) - 1);
+            $handBackConds[] = '  RewriteCond "' . $file . '" -f' . ($isLast ? '' : ' [OR]');
+        }
+        $rules = array_merge(array(
+            '  # Let WebP Express handle sources whose AVIF failed or would be larger than the source.',
+            '  RewriteCond %{QUERY_STRING} !dontreplace$',
+            '  RewriteCond %{QUERY_STRING} !original$',
+            '  RewriteCond %{HTTP_ACCEPT} image/avif [NC]',
+            '  RewriteCond %{REQUEST_FILENAME} -f',
+            '  RewriteCond %{REQUEST_FILENAME} "' . $sourceRegex . '" [NC]',
+        ), $handBackConds, array(
+            '  RewriteCond %{REQUEST_FILENAME}.dontreplace !-f',
+            '  RewriteCond %{REQUEST_FILENAME}.do-not-convert !-f',
+            '  RewriteRule ^.*$ - [E=WE_AVIF_NO_AVIF:1]'
+        ));
+        $rules = array_merge($rules, array(
+            '  # Serve an AVIF cache hit directly, as WebP Express does for WebP.',
+            '  RewriteCond %{ENV:WE_AVIF_NO_AVIF} !1',
+            '  RewriteCond %{QUERY_STRING} !dontreplace$',
+            '  RewriteCond %{QUERY_STRING} !original$',
+            '  RewriteCond %{HTTP_ACCEPT} image/avif [NC]',
+            '  RewriteCond %{REQUEST_FILENAME} -f',
+            '  RewriteCond %{REQUEST_FILENAME} "' . $sourceRegex . '" [NC]',
+            '  RewriteCond "' . $destinationPath . '" -f',
+        ));
+        $rules[] = '  RewriteCond %{REQUEST_FILENAME}.dontreplace !-f';
+        $rules[] = '  RewriteCond %{REQUEST_FILENAME}.do-not-convert !-f';
+        $rules[] = '  RewriteRule ^(.*)\.(' . implode('|', $extensions) . ')$ ' .
+            $destinationUrl . ' [E=WE_AVIF_EXISTING:1,NC,L]';
+
+        return $rules;
     }
 
     private static function rewriteEnvironmentFlags($config)
@@ -1988,15 +2271,21 @@ final class WebPExpressAvif
     private static function maybeConvertOnUpload($source)
     {
         $config = self::getConfig();
-        if (empty($config['convert-on-upload']) ||
-            !self::pictureModeEnabled($config) ||
-            !self::imageTypeEnabled($source, $config) ||
-            !self::sourceIsInScope($source, $config) ||
-            !self::hasActiveAvifEncoder($config)) {
+        if (!self::imageTypeEnabled($source, $config) || !self::sourceIsInScope($source, $config)) {
             return;
         }
 
         $destination = self::destinationForSource($source, $config);
+        if (is_string($destination)) {
+            self::removeAvifTooLargeMarker($destination);
+            self::removeAvifFailureMarker($destination);
+        }
+        if (empty($config['convert-on-upload']) ||
+            !self::pictureModeEnabled($config) ||
+            !self::hasActiveAvifEncoder($config)) {
+            return;
+        }
+
         $root = self::getDestinationRoot($source, $config);
         if ($destination === false || $root === false) {
             error_log('[WebP Express AVIF] Could not determine the AVIF destination for uploaded image: ' . $source);
@@ -2068,8 +2357,13 @@ final class WebPExpressAvif
         }
 
         $destination = self::destinationForSource($file, $config);
-        if (is_string($destination) && is_file($destination) && !unlink($destination)) {
-            error_log('[WebP Express AVIF] Could not remove derivative after deleting source: ' . $destination);
+        if (is_string($destination)) {
+            if (is_file($destination) && !unlink($destination)) {
+                error_log('[WebP Express AVIF] Could not remove derivative after deleting source: ' . $destination);
+            } else {
+                self::removeAvifTooLargeMarker($destination);
+                self::removeAvifFailureMarker($destination);
+            }
         }
         return $file;
     }
@@ -2100,7 +2394,7 @@ final class WebPExpressAvif
             \WebPExpress\Paths::getCacheDirAbs(),
             $config,
             $onlyPng,
-            ($config['destination-folder'] == 'mingled'),
+            false,
             self::$purgeResult
         );
     }
@@ -2136,10 +2430,26 @@ final class WebPExpressAvif
             $path = $iterator->getPathname();
             if (is_dir($path) && !is_link($path)) {
                 self::purgeAvifFiles($path, $config, $onlyPng, $mingled, $counts);
-            } elseif (is_file($path) &&
-                ($mingled ? preg_match('/\.webp\.avif$/i', $path) : preg_match('/\.avif$/i', $path))) {
+            } elseif (is_file($path)) {
+                $markerSuffix = '';
+                if (preg_match('/(\.we-avif-too-large|\.we-avif-failure)$/i', $path, $matches)) {
+                    $markerSuffix = $matches[1];
+                    $avifPath = substr($path, 0, -strlen($markerSuffix));
+                } else {
+                    $avifPath = $path;
+                }
+                $isExpectedAvif = $mingled
+                    ? preg_match('/\.webp\.avif$/i', $avifPath)
+                    : preg_match('/\.avif$/i', $avifPath);
+                if (!$isExpectedAvif) {
+                    $iterator->next();
+                    continue;
+                }
+
                 if ($onlyPng) {
-                    $webpPath = self::webpPathFromAvifPath($path, $config);
+                    $webpPath = $mingled
+                        ? preg_replace('/\.avif$/i', '', $avifPath)
+                        : preg_replace('/\.avif$/i', '.webp', $avifPath);
                     try {
                         $source = \WebPExpress\Convert::findSource($webpPath, $config);
                     } catch (\Exception $e) {
@@ -2153,8 +2463,18 @@ final class WebPExpressAvif
                     }
                 }
 
-                if (unlink($path)) {
+                if ($markerSuffix != '') {
+                    if (!unlink($path)) {
+                        $counts['fail-count']++;
+                        error_log('[WebP Express AVIF] Could not remove AVIF cache marker: ' . $path);
+                    }
+                } elseif (unlink($path)) {
                     $counts['delete-count']++;
+                    $sizeMarkerRemoved = self::removeAvifTooLargeMarker($path);
+                    $failureMarkerRemoved = self::removeAvifFailureMarker($path);
+                    if (!$sizeMarkerRemoved || !$failureMarkerRemoved) {
+                        $counts['fail-count']++;
+                    }
                 } else {
                     $counts['fail-count']++;
                     error_log('[WebP Express AVIF] Could not remove cached AVIF file: ' . $path);

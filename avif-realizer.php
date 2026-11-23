@@ -50,6 +50,72 @@ class AvifRealizer extends WodConfigLoader
         header('X-Content-Type-Options: nosniff');
     }
 
+    private static function markAvifTooLarge($destination)
+    {
+        $marker = $destination . '.we-avif-too-large';
+        if (is_file($marker)) {
+            return true;
+        }
+        if (@file_put_contents($marker, '', LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not mark an AVIF as larger than its source: ' . $destination);
+            return false;
+        }
+        return true;
+    }
+
+    private static function removeAvifTooLargeMarker($destination)
+    {
+        $marker = $destination . '.we-avif-too-large';
+        if (is_file($marker) && !@unlink($marker)) {
+            error_log('[WebP Express AVIF] Could not remove an AVIF size-rejection marker: ' . $marker);
+            return false;
+        }
+        return true;
+    }
+
+    private static function markAvifFailed($destination, $source, $encoder, $reason)
+    {
+        $marker = $destination . '.we-avif-failure';
+        $reason = preg_replace('/[\r\n\x00-\x1f\x7f]+/', ' ', (string) $reason);
+        $contents = 'time: ' . gmdate('c') . "\n" .
+            'source: ' . preg_replace('/[\r\n\x00-\x1f\x7f]+/', ' ', (string) $source) . "\n" .
+            'encoder: ' . (is_string($encoder) && ($encoder != '') ? $encoder : 'none') . "\n" .
+            'context: on-demand realizer' . "\n" .
+            'reason: ' . $reason . "\n";
+        if (@file_put_contents($marker, $contents, LOCK_EX) === false) {
+            error_log('[WebP Express AVIF] Could not write an AVIF failure marker: ' . $marker);
+            return false;
+        }
+        return true;
+    }
+
+    private static function removeAvifFailureMarker($destination)
+    {
+        $marker = $destination . '.we-avif-failure';
+        if (is_file($marker) && !@unlink($marker)) {
+            error_log('[WebP Express AVIF] Could not remove an AVIF failure marker: ' . $marker);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Logs a conversion failure, records it in the failure marker so Apache hands
+     * later requests to WebP Express, and returns false for the caller.
+     */
+    private static function conversionFailed($source, $destination, $encoder, $reason)
+    {
+        error_log('[WebP Express AVIF] ' . $reason . ': ' . $destination);
+        self::markAvifFailed($destination, $source, $encoder, $reason);
+        return false;
+    }
+
+    private static function lastPhpError()
+    {
+        $error = error_get_last();
+        return (is_array($error) && isset($error['message'])) ? $error['message'] : '';
+    }
+
     private static function fail($message, $status = 404)
     {
         error_log('[WebP Express AVIF] ' . $message);
@@ -202,6 +268,12 @@ class AvifRealizer extends WodConfigLoader
         }
 
         try {
+            // libgd's AVIF encoder rejects palette images (common for small PNGs).
+            if (!imageistruecolor($image) && !imagepalettetotruecolor($image)) {
+                throw new \RuntimeException('GD could not convert a palette image to truecolor.');
+            }
+            imagealphablending($image, false);
+            imagesavealpha($image, true);
             return imageavif($image, $temporaryFile, $quality) &&
                 is_file($temporaryFile) &&
                 (filesize($temporaryFile) > 0);
@@ -251,8 +323,10 @@ class AvifRealizer extends WodConfigLoader
         $pngQuality
     )
     {
+        $encoder = $converter['converter'];
         $directory = dirname($destination);
         if (!is_dir($directory) && !@mkdir($directory, 0755, true) && !is_dir($directory)) {
+            // Without the directory, no marker can be written either; just log.
             error_log('[WebP Express AVIF] Could not create destination directory: ' . $directory);
             return false;
         }
@@ -262,41 +336,47 @@ class AvifRealizer extends WodConfigLoader
             if (is_string($temporaryFile) && is_file($temporaryFile)) {
                 @unlink($temporaryFile);
             }
-            error_log('[WebP Express AVIF] Could not create a temporary AVIF in: ' . $directory);
-            return false;
+            return self::conversionFailed($source, $destination, $encoder, 'Could not create a temporary AVIF file');
         }
 
         try {
             $quality = self::quality($source, $jpegQuality, $pngQuality);
             $metadata = isset($convertOptions['metadata']) ? $convertOptions['metadata'] : 'none';
-            if ($converter['converter'] == 'imagick') {
+            error_clear_last();
+            if ($encoder == 'imagick') {
                 $converted = self::encodeWithImagick($source, $temporaryFile, $quality, $metadata);
             } else {
                 $converted = self::encodeWithGd($source, $temporaryFile, $quality);
             }
             if (!$converted) {
-                return false;
+                $phpError = self::lastPhpError();
+                return self::conversionFailed(
+                    $source,
+                    $destination,
+                    $encoder,
+                    'Encoder produced no AVIF output' . (($phpError != '') ? ' (' . $phpError . ')' : '')
+                );
             }
             if ($preventLarger && (filesize($temporaryFile) >= filesize($source))) {
                 error_log('[WebP Express AVIF] Skipping AVIF that is larger than its source: ' . $destination);
+                self::removeAvifFailureMarker($destination);
+                self::markAvifTooLarge($destination);
                 return false;
             }
             if (!@chmod($temporaryFile, 0644)) {
-                error_log('[WebP Express AVIF] Could not set public read permissions on ' . $temporaryFile);
-                return false;
+                return self::conversionFailed($source, $destination, $encoder, 'Could not set public read permissions on the temporary AVIF');
             }
             if (!@rename($temporaryFile, $destination)) {
-                error_log('[WebP Express AVIF] Could not move the converted file into place: ' . $destination);
-                return false;
+                return self::conversionFailed($source, $destination, $encoder, 'Could not move the converted AVIF into place');
             }
             if (!@chmod($destination, 0644)) {
-                error_log('[WebP Express AVIF] Could not set public read permissions on ' . $destination);
-                return false;
+                return self::conversionFailed($source, $destination, $encoder, 'Could not set public read permissions on the AVIF');
             }
+            self::removeAvifTooLargeMarker($destination);
+            self::removeAvifFailureMarker($destination);
             return true;
         } catch (\Throwable $e) {
-            error_log('[WebP Express AVIF] AVIF conversion failed: ' . $e->getMessage());
-            return false;
+            return self::conversionFailed($source, $destination, $encoder, 'AVIF conversion failed: ' . $e->getMessage());
         } finally {
             if (is_file($temporaryFile)) {
                 @unlink($temporaryFile);
@@ -319,7 +399,10 @@ class AvifRealizer extends WodConfigLoader
         }
         header('X-Content-Type-Options: nosniff');
         header('Content-Type: image/avif');
-        header('X-WebP-Express-AVIF-Status: ' . $status);
+        // Worded like WebP Express's "X-WebP-Express: Redirected directly to existing webp".
+        header('X-WebP-Express-AVIF: ' . (($status == 'converted')
+            ? 'Converted to avif by realizer'
+            : 'Served existing avif by realizer'));
         if ($varyAccept) {
             header('Vary: Accept', false);
         }
@@ -537,13 +620,20 @@ class AvifRealizer extends WodConfigLoader
         if (is_file($destination)) {
             $destinationSize = filesize($destination);
             $sourceSize = filesize($source);
+            if ($preventLarger && (($destinationSize === false) || ($sourceSize === false))) {
+                error_log('[WebP Express AVIF] Could not verify cached AVIF size against its source: ' . $destination);
+                self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
+            }
             if ($preventLarger && ($destinationSize !== false) && ($sourceSize !== false) &&
                 ($destinationSize >= $sourceSize)) {
                 error_log('[WebP Express AVIF] Removing cached AVIF that is larger than its source: ' . $destination);
+                self::markAvifTooLarge($destination);
                 if (!@unlink($destination)) {
                     self::serveWebpFallback($source, $webpDestination, $wodOptions, $options);
                 }
             } else {
+                self::removeAvifTooLargeMarker($destination);
+                self::removeAvifFailureMarker($destination);
                 self::serve(
                     $destination,
                     $options,
@@ -561,6 +651,9 @@ class AvifRealizer extends WodConfigLoader
 
         $converter = self::findAvifEncoder($convertOptions);
         if ($converter === false) {
+            if (is_dir(dirname($destination))) {
+                self::markAvifFailed($destination, $source, '', 'No active AVIF encoder (GD imageavif or Imagick AVIF) is available');
+            }
             AvifConversionLogger::log(
                 $source,
                 $destination,
@@ -682,9 +775,15 @@ class AvifRealizer extends WodConfigLoader
             if (is_file($destination)) {
                 $destinationSize = filesize($destination);
                 $sourceSize = filesize($source);
+                if ($preventLarger && (($destinationSize === false) || ($sourceSize === false))) {
+                    error_log('[WebP Express AVIF] Could not verify cached AVIF size against its source: ' . $destination);
+                    self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
+                }
                 if ($preventLarger && ($destinationSize !== false) && ($sourceSize !== false) &&
                     ($destinationSize >= $sourceSize)) {
                     error_log('[WebP Express AVIF] Removing cached AVIF that is larger than its source: ' . $destination);
+                    self::markAvifTooLarge($destination);
+
                     if (!@unlink($destination)) {
                         self::redirectToWebp($wodOptions['destination-folder'] == 'mingled');
                     }
@@ -702,6 +801,9 @@ class AvifRealizer extends WodConfigLoader
 
             $converter = self::findAvifEncoder($convertOptions);
             if ($converter === false) {
+                if (is_dir(dirname($destination))) {
+                    self::markAvifFailed($destination, $source, '', 'No active AVIF encoder (GD imageavif or Imagick AVIF) is available');
+                }
                 AvifConversionLogger::log(
                     $source,
                     $destination,
